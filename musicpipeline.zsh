@@ -1,0 +1,1074 @@
+#!/usr/bin/env zsh
+#
+# musicpipeline.zsh
+# Authored by Stephen J. Smith
+# Created: 2026-04-18
+# Purpose: Audit, sort, convert, and undo music-library intake workflows.
+
+emulate -L zsh
+setopt pipe_fail no_unset extended_glob
+
+source "${${(%):-%x}:A:h}/musicpipeline_common.zsh"
+# Source the worker scripts in "library mode" so we can call their main
+# functions without auto-running them on import.
+typeset -g MUSICLIB_SOURCE_ONLY=1
+source "${${(%):-%x}:A:h}/sort_music.zsh"
+source "${${(%):-%x}:A:h}/convert_music.zsh"
+unset MUSICLIB_SOURCE_ONLY
+
+# These associative arrays act like simple sets/maps for the current wrapper
+# run: one for artist roots we still need to process, one for artist roots that
+# should skip conversion because routing left them in a risky state.
+typeset -gA musicpipeline_ARTIST_TARGETS=()
+typeset -gA musicpipeline_BLOCKED_CONVERT_ARTISTS=()
+typeset -gi musicpipeline_PROCESSED_ARTIST_COUNT=0
+typeset -gi musicpipeline_AUDIT_WARNING_COUNT=0
+
+musicpipeline_usage() {
+  cat <<'EOF'
+Usage: musicpipeline <audit|sort|convert|both|undo|cleanup-originals> [options] [target]
+       zsh ./musicpipeline.zsh <audit|sort|convert|both|undo|cleanup-originals> [options] [target]
+
+Commands:
+  audit       Read-only analysis of a target root
+  sort        Normalize folders and track filenames
+  convert     Convert FLAC/WAV/AIFF/AIF sources to ALAC
+  both        Run conversion first, then sorts
+  undo        Undo the last successful manifest-backed run for the target
+  cleanup-originals  Delete _originalSource folders after typed confirmation
+
+Options:
+  --dry-run         Log intended sort/convert changes without mutating files
+  --keep-sidecars   Preserve .cue/.log/.txt files during sort
+  -h, --help        Show this help text
+
+Target Types:
+  - collection parent: contains configured lossless and lossy roots
+  - archive root: mixed artist folders, loose release folders, and loose tracks
+  - artist root: one artist folder containing releases and/or loose tracks
+EOF
+}
+
+musicpipeline_prompt_mode() {
+  local mode
+
+  # If the user ran the wrapper with no subcommand in an interactive shell,
+  # give them a quick prompt instead of just erroring out.
+  [[ -t 0 ]] || return 1
+  print "Select mode: audit, sort, convert, both, undo, cleanup-originals"
+  read "mode?Mode: "
+  case "$mode" in
+    audit|sort|convert|both|undo|cleanup-originals)
+      print -r -- "$mode"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+musicpipeline_register_artist() {
+  local artist_root="${1:A}"
+  [[ -n "$artist_root" ]] || return 0
+  musicpipeline_ARTIST_TARGETS["$artist_root"]=1
+}
+
+musicpipeline_block_convert_for_artist() {
+  local artist_root="${1:A}"
+  local reason="$2"
+  [[ -n "$artist_root" ]] || return 0
+  musicpipeline_BLOCKED_CONVERT_ARTISTS["$artist_root"]="$reason"
+}
+
+musicpipeline_sorted_artist_targets() {
+  local -a artists
+
+  # Pull the associative-array keys back out as a clean sorted list so later
+  # loops stay deterministic even when paths contain spaces.
+  artists=("${(@Qk)musicpipeline_ARTIST_TARGETS}")
+  print -rl -- "${(@o)artists}"
+}
+
+# These helpers classify direct children so the wrapper can decide whether a
+# root is holding artist folders, release folders, or just random clutter.
+musicpipeline_direct_child_dirs() {
+  local root="$1"
+  find "$root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort
+}
+
+musicpipeline_direct_release_dirs() {
+  local root="$1"
+  local dir
+
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    if [[ "$(ml_dir_kind "$dir")" == "release" ]]; then
+      print -r -- "$dir"
+    fi
+  done < <(musicpipeline_direct_child_dirs "$root")
+}
+
+musicpipeline_direct_artist_dirs() {
+  local root="$1"
+  local dir
+
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || continue
+    if [[ "$(ml_dir_kind "$dir")" == "artist" ]]; then
+      print -r -- "$dir"
+    fi
+  done < <(musicpipeline_direct_child_dirs "$root")
+}
+
+musicpipeline_find_archive_root() {
+  local dir="${1:A}"
+
+  # Walk up until we hit a configured archive root name or the filesystem root.
+  while [[ "$dir" != "/" ]]; do
+    if [[ -n "$LOSSLESS_DIR_NAME" && "${dir:t}" == "$LOSSLESS_DIR_NAME" ]]; then
+      print -r -- "$dir"
+      return 0
+    fi
+    if [[ -n "$LOSSY_DIR_NAME" && "${dir:t}" == "$LOSSY_DIR_NAME" ]]; then
+      print -r -- "$dir"
+      return 0
+    fi
+    dir="${dir:h}"
+  done
+
+  return 1
+}
+
+musicpipeline_prepare_config() {
+  local script_dir="$1"
+  local target_root="$2"
+
+  # Plain artist-root or generic batch use should not force config setup. Only
+  # archive-aware runs really care about the configured archive names.
+  ml_load_config_if_present "$script_dir" && return 0
+
+  if ml_target_looks_like_artist_root "$target_root" || ml_target_has_batch_content "$target_root"; then
+    return 0
+  fi
+
+  [[ -t 0 ]] || return 0
+  ml_bootstrap_config_if_needed "$script_dir" "$target_root"
+  ml_load_config_if_present "$script_dir" || true
+}
+
+musicpipeline_detect_root_type() {
+  ml_classify_root "$1"
+}
+
+musicpipeline_missing_tags_for_file() {
+  local file="$1"
+  local tags
+  local -a missing
+
+  # Audit wants a compact "what's missing?" answer without having to parse the
+  # ffprobe output at every call site.
+  tags="$(ml_file_tags "$file")"
+  if [[ -z "$(ml_tag_value album_artist "$tags")" && -z "$(ml_tag_value artist "$tags")" ]]; then
+    missing+=("album_artist_or_artist")
+  fi
+  [[ -n "$(ml_tag_value album "$tags")" ]] || missing+=("album")
+  [[ -n "$(ml_tag_value title "$tags")" ]] || missing+=("title")
+  [[ -n "$(ml_tag_value track "$tags")" ]] || missing+=("track")
+  [[ -n "$(ml_tag_value disc "$tags")" ]] || missing+=("disc")
+  [[ -n "$(ml_tag_value date "$tags")" ]] || missing+=("date")
+
+  print -r -- "${(j:, :)missing}"
+}
+
+musicpipeline_warn_audit() {
+  (( musicpipeline_AUDIT_WARNING_COUNT++ ))
+  ml_warn "$*"
+}
+
+# Figure out which artist root a release or loose track really belongs to. In a
+# lossy archive, lossless sources get pointed at the sibling lossless root.
+musicpipeline_desired_artist_root_for_release() {
+  local release_dir="$1"
+  local parent_root="$2"
+  local archive_type="$3"
+  local artist base_root
+
+  artist="$(ml_release_primary_artist "$release_dir")"
+  [[ -n "$artist" ]] || return 10
+
+  base_root="$parent_root"
+  if [[ "$archive_type" == "archive_lossy" ]] && ml_release_has_lossless_sources "$release_dir"; then
+    [[ -n "$LOSSLESS_DIR_NAME" ]] || return 11
+    base_root="$(ml_sibling_lossless_root "$parent_root")"
+    [[ -d "$base_root" ]] || return 12
+  fi
+
+  print -r -- "$base_root/$artist"
+}
+
+musicpipeline_desired_artist_root_for_track() {
+  local track="$1"
+  local parent_root="$2"
+  local archive_type="$3"
+  local artist base_root
+
+  artist="$(ml_primary_artist_from_file "$track")"
+  [[ -n "$artist" ]] || return 10
+
+  base_root="$parent_root"
+  if [[ "$archive_type" == "archive_lossy" ]] && ml_is_lossless_extension "$track"; then
+    [[ -n "$LOSSLESS_DIR_NAME" ]] || return 11
+    base_root="$(ml_sibling_lossless_root "$parent_root")"
+    [[ -d "$base_root" ]] || return 12
+  fi
+
+  print -r -- "$base_root/$artist"
+}
+
+# Turn routing error codes into readable log messages, and block conversion for
+# artist roots that would otherwise be left in a half-rerouted state.
+musicpipeline_note_unroutable_release() {
+  local release_dir="$1"
+  local parent_root="$2"
+  local current_artist_root="$3"
+  local rc="$4"
+  local msg
+
+  case "$rc" in
+    10)
+      msg="missing album artist/artist tags"
+      ;;
+    11)
+      msg="lossless reroute requested but config is missing LOSSLESS_DIR_NAME"
+      ;;
+    12)
+      msg="lossless reroute destination is unavailable"
+      ;;
+    *)
+      msg="unable to resolve destination artist root"
+      ;;
+  esac
+
+  musicpipeline_warn_audit "release routing issue: $msg: $(ml_display_path "$release_dir")"
+  ml_record_event "skip" "$release_dir" "$parent_root" "$msg" "route_release"
+
+  if [[ "${current_artist_root:A}" != "${parent_root:A}" && ( "$rc" == 10 || "$rc" == 11 || "$rc" == 12 ) ]] && ml_release_has_lossless_sources "$release_dir"; then
+    musicpipeline_block_convert_for_artist "$current_artist_root" "$msg"
+  fi
+}
+
+musicpipeline_note_unroutable_track() {
+  local track="$1"
+  local parent_root="$2"
+  local current_artist_root="$3"
+  local rc="$4"
+  local msg
+
+  case "$rc" in
+    10)
+      msg="missing album artist/artist tags"
+      ;;
+    11)
+      msg="lossless reroute requested but config is missing LOSSLESS_DIR_NAME"
+      ;;
+    12)
+      msg="lossless reroute destination is unavailable"
+      ;;
+    *)
+      msg="unable to resolve destination artist root"
+      ;;
+  esac
+
+  musicpipeline_warn_audit "track routing issue: $msg: $(ml_display_path "$track")"
+  ml_record_event "skip" "$track" "$parent_root" "$msg" "route_loose_track"
+
+  if [[ "${current_artist_root:A}" != "${parent_root:A}" && ( "$rc" == 10 || "$rc" == 11 || "$rc" == 12 ) ]] && ml_is_lossless_extension "$track"; then
+    musicpipeline_block_convert_for_artist "$current_artist_root" "$msg"
+  fi
+}
+
+# Treat an already-selected artist root as correct when its folder name matches
+# the resolved artist after normalization, even if the raw path text differs.
+musicpipeline_artist_root_matches_destination() {
+  local current_artist_root="$1"
+  local parent_root="$2"
+  local desired_artist_root="$3"
+
+  [[ "${desired_artist_root:A}" == "${current_artist_root:A}" ]] && return 0
+  [[ "${current_artist_root:A}" == "${parent_root:A}" ]] && return 1
+  [[ "$(ml_normalize_match_name "${current_artist_root:t}")" == "$(ml_normalize_match_name "${desired_artist_root:t}")" ]]
+}
+
+# Move a release/track only when it actually belongs somewhere else. A return of
+# 1 here usually just means "nothing to do", not "something exploded".
+musicpipeline_route_release_if_needed() {
+  local release_dir="$1"
+  local parent_root="$2"
+  local archive_type="$3"
+  local current_artist_root="$4"
+  local desired_artist_root rc release_target
+
+  desired_artist_root="$(musicpipeline_desired_artist_root_for_release "$release_dir" "$parent_root" "$archive_type")"
+  rc=$?
+  if (( rc != 0 )); then
+    if [[ "${current_artist_root:A}" != "${parent_root:A}" && "$rc" == 10 ]]; then
+      return 1
+    fi
+    musicpipeline_note_unroutable_release "$release_dir" "$parent_root" "$current_artist_root" "$rc"
+    ml_move_to_unknown "$release_dir" "$parent_root" "unroutable release" "route_unknown" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  if musicpipeline_artist_root_matches_destination "$current_artist_root" "$parent_root" "$desired_artist_root"; then
+    return 1
+  fi
+
+  release_target="$desired_artist_root/${release_dir:t}"
+  if ml_route_release_to_artist "$release_dir" "$desired_artist_root"; then
+    ml_log_move "route release" "$release_dir" "$release_target"
+    musicpipeline_register_artist "$desired_artist_root"
+    return 0
+  fi
+
+  ml_move_to_unknown "$release_dir" "$parent_root" "route release conflict" "route_unknown" >/dev/null 2>&1 || true
+
+  return 1
+}
+
+musicpipeline_route_track_if_needed() {
+  local track="$1"
+  local parent_root="$2"
+  local archive_type="$3"
+  local current_artist_root="$4"
+  local desired_artist_root rc dst_file
+
+  desired_artist_root="$(musicpipeline_desired_artist_root_for_track "$track" "$parent_root" "$archive_type")"
+  rc=$?
+  if (( rc != 0 )); then
+    if [[ "${current_artist_root:A}" != "${parent_root:A}" && "$rc" == 10 ]]; then
+      return 1
+    fi
+    musicpipeline_note_unroutable_track "$track" "$parent_root" "$current_artist_root" "$rc"
+    ml_move_to_unknown "$track" "$parent_root" "unroutable loose track" "route_unknown" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  if musicpipeline_artist_root_matches_destination "$current_artist_root" "$parent_root" "$desired_artist_root"; then
+    return 1
+  fi
+
+  dst_file="$(ml_loose_track_target_path "$track" "$desired_artist_root")"
+
+  if ml_route_loose_track_to_artist "$track" "$desired_artist_root"; then
+    ml_log_move "copy to library" "$track" "$dst_file"
+    musicpipeline_register_artist "$desired_artist_root"
+    return 0
+  fi
+
+  ml_move_to_unknown "$track" "$parent_root" "route loose track conflict" "route_unknown" >/dev/null 2>&1 || true
+
+  return 1
+}
+
+# Sweep one artist root for misplaced releases/loose files, then keep looping
+# across registered artist roots until no more rerouting is happening.
+musicpipeline_rehome_artist_root() {
+  local artist_root="$1"
+  local parent_root="${artist_root:h}"
+  local archive_type
+  local -a release_dirs loose_tracks
+  local release_dir track
+
+  [[ -d "$artist_root" ]] || return 0
+
+  archive_type="$(ml_enclosing_archive_type "$artist_root")"
+  release_dirs=("${(@f)$(musicpipeline_direct_release_dirs "$artist_root")}")
+  for release_dir in "${release_dirs[@]}"; do
+    [[ -n "$release_dir" ]] || continue
+    [[ -e "$release_dir" ]] || continue
+    musicpipeline_route_release_if_needed "$release_dir" "$parent_root" "$archive_type" "$artist_root"
+  done
+
+  loose_tracks=("${(@f)$(ml_find_loose_audio_files "$artist_root" | LC_ALL=C sort)}")
+  for track in "${loose_tracks[@]}"; do
+    [[ -n "$track" ]] || continue
+    [[ -e "$track" ]] || continue
+    musicpipeline_route_track_if_needed "$track" "$parent_root" "$archive_type" "$artist_root"
+  done
+}
+
+musicpipeline_rehome_registered_artist_targets() {
+  local -A visited=()
+  local -a artist_roots
+  local artist_root progressed
+
+  while :; do
+    progressed=0
+    artist_roots=("${(@Qk)musicpipeline_ARTIST_TARGETS}")
+    artist_roots=("${(@o)artist_roots}")
+    for artist_root in "${artist_roots[@]}"; do
+      [[ -n "$artist_root" ]] || continue
+      [[ -n "${visited["$artist_root"]:-}" ]] && continue
+      visited["$artist_root"]=1
+      [[ -d "$artist_root" ]] || continue
+      musicpipeline_rehome_artist_root "$artist_root"
+      progressed=1
+    done
+    (( progressed )) || break
+  done
+}
+
+# Audit helpers. These mirror the mutate path, but only report what would
+# happen and where conflicts are waiting.
+musicpipeline_audit_release_dir() {
+  local release_dir="$1"
+  local target_artist_root="$2"
+  local first_audio normalized_dir
+  local -a audio_files
+  local -A planned=()
+  local file target_name target_path output_path missing
+
+  first_audio="$(ml_first_audio_file "$release_dir")"
+  if [[ -z "$first_audio" ]]; then
+    musicpipeline_warn_audit "non-audio release directory: $release_dir"
+    ml_record_event "skip" "$release_dir" "" "non-audio release directory" "audit_release"
+    return 0
+  fi
+
+  normalized_dir="$target_artist_root/$(ml_release_target_dir_name "$release_dir")"
+
+  ml_log "release: $release_dir"
+  ml_log "target:  $normalized_dir"
+  ml_record_event "audit_release" "$release_dir" "$normalized_dir" "release plan" ""
+
+  if [[ "${normalized_dir:A}" != "${release_dir:A}" && -e "$normalized_dir" ]]; then
+    musicpipeline_warn_audit "folder conflict: normalized release already exists: $normalized_dir"
+    ml_record_event "audit_conflict" "$release_dir" "$normalized_dir" "normalized release already exists" "release"
+  fi
+
+  audio_files=("${(@f)$(ml_find_audio_files "$release_dir" | LC_ALL=C sort)}")
+  for file in "${audio_files[@]}"; do
+    [[ -n "$file" ]] || continue
+    [[ -e "$file" ]] || continue
+
+    target_name="$(ml_track_target_name "$file")"
+    target_path="$normalized_dir/$target_name"
+
+    if [[ -n "${planned["$target_path"]:-}" && "${planned["$target_path"]}" != "$file" ]]; then
+      musicpipeline_warn_audit "duplicate normalized track target: $target_path"
+      ml_record_event "audit_conflict" "$file" "$target_path" "duplicate normalized track target" "track"
+    else
+      planned["$target_path"]="$file"
+    fi
+
+    if [[ "${target_path:A}" != "${file:A}" && -e "$target_path" ]]; then
+      musicpipeline_warn_audit "track conflict: target already exists: $target_path"
+      ml_record_event "audit_conflict" "$file" "$target_path" "track target already exists" "track"
+    fi
+
+    missing="$(musicpipeline_missing_tags_for_file "$file")"
+    if [[ -n "$missing" ]]; then
+      musicpipeline_warn_audit "missing tags [$missing]: $file"
+      ml_record_event "audit_missing_tags" "$file" "" "$missing" "track"
+    fi
+
+    if ml_is_lossless_extension "$file" && [[ "${file:e:l}" != "alac" ]]; then
+      output_path="${target_path:r}.m4a"
+      if [[ -e "$output_path" ]]; then
+        musicpipeline_warn_audit "existing ALAC output may block conversion: $output_path"
+        ml_record_event "audit_conflict" "$file" "$output_path" "existing ALAC output" "convert"
+      else
+        ml_log "convert: $file -> $output_path"
+        ml_record_event "audit_convert" "$file" "$output_path" "lossless source eligible for conversion" ""
+      fi
+    fi
+  done
+}
+
+musicpipeline_audit_track_in_context() {
+  local track="$1"
+  local parent_root="$2"
+  local archive_type="$3"
+  local current_artist_root="$4"
+  local desired_artist_root rc normalized_track output_path missing
+
+  desired_artist_root="$(musicpipeline_desired_artist_root_for_track "$track" "$parent_root" "$archive_type")"
+  rc=$?
+  if (( rc != 0 )); then
+    if [[ "${current_artist_root:A}" != "${parent_root:A}" && "$rc" == 10 ]]; then
+      desired_artist_root="$current_artist_root"
+    else
+      musicpipeline_note_unroutable_track "$track" "$parent_root" "$current_artist_root" "$rc"
+      if [[ "${current_artist_root:A}" != "${parent_root:A}" ]]; then
+        desired_artist_root="$current_artist_root"
+      else
+        return 0
+      fi
+    fi
+  fi
+
+  if musicpipeline_artist_root_matches_destination "$current_artist_root" "$parent_root" "$desired_artist_root"; then
+    desired_artist_root="$current_artist_root"
+  fi
+
+  normalized_track="$(ml_loose_track_target_path "$track" "$desired_artist_root")"
+
+  ml_log "loose track: $track"
+  ml_log "target:     $normalized_track"
+  ml_record_event "audit_loose_track" "$track" "$normalized_track" "loose track plan" ""
+
+  if [[ "${normalized_track:A}" != "${track:A}" && -e "$normalized_track" ]]; then
+    musicpipeline_warn_audit "track conflict: normalized loose track already exists: $normalized_track"
+    ml_record_event "audit_conflict" "$track" "$normalized_track" "normalized loose track already exists" "route_loose_track"
+  fi
+
+  missing="$(musicpipeline_missing_tags_for_file "$track")"
+  if [[ -n "$missing" ]]; then
+    musicpipeline_warn_audit "missing tags [$missing]: $track"
+    ml_record_event "audit_missing_tags" "$track" "" "$missing" "loose_track"
+  fi
+
+  if ml_is_lossless_extension "$track" && [[ "${track:e:l}" != "alac" ]]; then
+    output_path="${normalized_track:r}.m4a"
+    if [[ -e "$output_path" ]]; then
+      musicpipeline_warn_audit "existing ALAC output may block conversion: $output_path"
+      ml_record_event "audit_conflict" "$track" "$output_path" "existing ALAC output" "convert"
+    else
+      ml_log "convert: $track -> $output_path"
+      ml_record_event "audit_convert" "$track" "$output_path" "lossless loose track eligible for conversion" ""
+    fi
+  fi
+}
+
+musicpipeline_audit_release_in_context() {
+  local release_dir="$1"
+  local parent_root="$2"
+  local archive_type="$3"
+  local current_artist_root="$4"
+  local desired_artist_root rc
+
+  desired_artist_root="$(musicpipeline_desired_artist_root_for_release "$release_dir" "$parent_root" "$archive_type")"
+  rc=$?
+  if (( rc != 0 )); then
+    if [[ "${current_artist_root:A}" != "${parent_root:A}" && "$rc" == 10 ]]; then
+      desired_artist_root="$current_artist_root"
+    else
+      musicpipeline_note_unroutable_release "$release_dir" "$parent_root" "$current_artist_root" "$rc"
+      if [[ "${current_artist_root:A}" != "${parent_root:A}" ]]; then
+        desired_artist_root="$current_artist_root"
+      else
+        return 0
+      fi
+    fi
+  fi
+
+  if musicpipeline_artist_root_matches_destination "$current_artist_root" "$parent_root" "$desired_artist_root"; then
+    desired_artist_root="$current_artist_root"
+  else
+    ml_log "route release: $release_dir -> $desired_artist_root/${release_dir:t}"
+    ml_record_event "audit_route_release" "$release_dir" "$desired_artist_root/${release_dir:t}" "route release to primary artist folder" ""
+  fi
+
+  musicpipeline_audit_release_dir "$release_dir" "$desired_artist_root"
+}
+
+musicpipeline_audit_artist_root() {
+  local artist_root="$1"
+  local parent_root="${artist_root:h}"
+  local archive_type
+  local -a direct_dirs loose_tracks
+  local dir kind track
+
+  ml_log ""
+  ml_log "Artist root: $artist_root"
+  archive_type="$(ml_enclosing_archive_type "$artist_root")"
+  ml_log "Archive context: $archive_type"
+  ml_record_event "audit_artist_root" "$artist_root" "" "$archive_type" ""
+
+  direct_dirs=("${(@f)$(musicpipeline_direct_child_dirs "$artist_root")}")
+  for dir in "${direct_dirs[@]}"; do
+    [[ -n "$dir" ]] || continue
+    kind="$(ml_dir_kind "$dir")"
+    case "$kind" in
+      release)
+        musicpipeline_audit_release_in_context "$dir" "$parent_root" "$archive_type" "$artist_root"
+        ;;
+      artist)
+        musicpipeline_audit_artist_root "$dir"
+        ;;
+      *)
+        musicpipeline_warn_audit "unknown directory inside artist root: $dir"
+        ml_record_event "skip" "$dir" "" "unknown directory kind" "artist_root"
+        ;;
+    esac
+  done
+
+  loose_tracks=("${(@f)$(ml_find_loose_audio_files "$artist_root" | LC_ALL=C sort)}")
+  for track in "${loose_tracks[@]}"; do
+    [[ -n "$track" ]] || continue
+    musicpipeline_audit_track_in_context "$track" "$parent_root" "$archive_type" "$artist_root"
+  done
+}
+
+musicpipeline_audit_batch_root() {
+  local root="$1"
+  local archive_type="$2"
+  local -a direct_dirs loose_tracks
+  local dir kind track
+
+  ml_log ""
+  ml_log "Batch root: $root"
+  ml_log "Root type: $archive_type"
+  ml_record_event "audit_batch_root" "$root" "" "$archive_type" ""
+
+  direct_dirs=("${(@f)$(musicpipeline_direct_child_dirs "$root")}")
+  for dir in "${direct_dirs[@]}"; do
+    [[ -n "$dir" ]] || continue
+    kind="$(ml_dir_kind "$dir")"
+    case "$kind" in
+      artist)
+        musicpipeline_audit_artist_root "$dir"
+        ;;
+      release)
+        musicpipeline_audit_release_in_context "$dir" "$root" "$archive_type" "$root"
+        ;;
+      *)
+        musicpipeline_warn_audit "unknown top-level directory: $dir"
+        ml_record_event "skip" "$dir" "" "unknown top-level directory" "batch_root"
+        ;;
+    esac
+  done
+
+  loose_tracks=("${(@f)$(ml_find_loose_audio_files "$root" | LC_ALL=C sort)}")
+  for track in "${loose_tracks[@]}"; do
+    [[ -n "$track" ]] || continue
+    musicpipeline_audit_track_in_context "$track" "$root" "$archive_type" "$root"
+  done
+}
+
+musicpipeline_audit_collection_parent() {
+  local root="$1"
+  local lossless_root="$root/$LOSSLESS_DIR_NAME"
+  local lossy_root="$root/$LOSSY_DIR_NAME"
+
+  ml_log "Collection parent: $root"
+  ml_record_event "audit_collection_parent" "$root" "" "collection_parent" ""
+
+  [[ -d "$lossless_root" ]] && musicpipeline_audit_batch_root "$lossless_root" "archive_lossless"
+  [[ -d "$lossy_root" ]] && musicpipeline_audit_batch_root "$lossy_root" "archive_lossy"
+}
+
+# Pre-processing before sort/convert. Batch roots need to register existing
+# artist folders, route loose releases/tracks, then run the reroute sweep.
+musicpipeline_prepare_batch_root() {
+  local root="$1"
+  local archive_type="$2"
+  local -a direct_dirs loose_tracks loose_files
+  local dir kind track file
+
+  direct_dirs=("${(@f)$(musicpipeline_direct_child_dirs "$root")}")
+  for dir in "${direct_dirs[@]}"; do
+    [[ -n "$dir" ]] || continue
+    kind="$(ml_dir_kind "$dir")"
+    [[ "$kind" == "artist" ]] && musicpipeline_register_artist "$dir"
+  done
+
+  for dir in "${direct_dirs[@]}"; do
+    [[ -n "$dir" ]] || continue
+    kind="$(ml_dir_kind "$dir")"
+    case "$kind" in
+      release)
+        musicpipeline_route_release_if_needed "$dir" "$root" "$archive_type" "$root"
+        ;;
+      artist)
+        ;;
+      *)
+        if ml_move_to_unknown "$dir" "$root" "unknown top-level directory" "route_unknown"; then
+          ml_log_step "unknown" "$(ml_display_path "$dir")"
+        else
+          ml_warn "skipping unknown top-level directory: $dir"
+          ml_record_event "skip" "$dir" "" "unknown top-level directory" "batch_root"
+        fi
+        ;;
+    esac
+  done
+
+  loose_tracks=("${(@f)$(ml_find_loose_audio_files "$root" | LC_ALL=C sort)}")
+  for track in "${loose_tracks[@]}"; do
+    [[ -n "$track" ]] || continue
+    musicpipeline_route_track_if_needed "$track" "$root" "$archive_type" "$root"
+  done
+
+  loose_files=("${(@f)$(find "$root" -mindepth 1 -maxdepth 1 -type f ! \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' \) | LC_ALL=C sort)}")
+  for file in "${loose_files[@]}"; do
+    [[ -n "$file" ]] || continue
+    if ml_move_to_unknown "$file" "$root" "unknown top-level file" "route_unknown"; then
+      ml_log_step "unknown" "$(ml_display_path "$file")"
+    else
+      ml_warn "skipping unknown top-level file: $file"
+      ml_record_event "skip" "$file" "" "unknown top-level file" "batch_root"
+    fi
+  done
+
+  musicpipeline_rehome_registered_artist_targets
+}
+
+musicpipeline_prepare_artist_root() {
+  local artist_root="$1"
+
+  musicpipeline_register_artist "$artist_root"
+  musicpipeline_rehome_registered_artist_targets
+}
+
+# Thin wrappers around the worker scripts so the top-level wrapper can pass down
+# flags without duplicating their inner logic.
+musicpipeline_run_sort_for_artist() {
+  local artist_root="$1"
+  local -a args
+
+  args=()
+  (( musicpipeline_DRY_RUN )) && args+=(--dry-run)
+  (( musicpipeline_KEEP_SIDECARS )) && args+=(--keep-sidecars)
+  args+=("$artist_root")
+  sort_music_main "${args[@]}"
+}
+
+musicpipeline_run_convert_for_artist() {
+  local artist_root="$1"
+  local -a args
+
+  if [[ -n "${musicpipeline_BLOCKED_CONVERT_ARTISTS["$artist_root"]:-}" ]]; then
+    ml_warn "skipping convert for $artist_root: ${musicpipeline_BLOCKED_CONVERT_ARTISTS["$artist_root"]}"
+    ml_record_event "skip" "$artist_root" "" "${musicpipeline_BLOCKED_CONVERT_ARTISTS["$artist_root"]}" "convert_artist_root"
+    return 0
+  fi
+
+  args=()
+  (( musicpipeline_DRY_RUN )) && args+=(--dry-run)
+  args+=("$artist_root")
+  convert_music_main "${args[@]}"
+}
+
+musicpipeline_release_target_after_sort() {
+  local release_dir="$1"
+  local normalized_dir
+
+  [[ -n "$(ml_first_audio_file "$release_dir")" ]] || {
+    print -r -- "$release_dir"
+    return 0
+  }
+
+  normalized_dir="${release_dir:h}/$(ml_release_target_dir_name "$release_dir")"
+
+  if (( ! musicpipeline_DRY_RUN )) && [[ -d "$normalized_dir" ]]; then
+    print -r -- "$normalized_dir"
+  else
+    print -r -- "$release_dir"
+  fi
+}
+
+musicpipeline_process_release_root() {
+  local mode="$1"
+  local release_dir="$2"
+  local current_release_dir="$release_dir"
+  local -a args
+
+  ml_log_scope "release" "$release_dir"
+
+  case "$mode" in
+    sort)
+      sort_release_dir "$current_release_dir"
+      ;;
+    convert)
+      args=()
+      (( musicpipeline_DRY_RUN )) && args+=(--dry-run)
+      args+=("$current_release_dir")
+      convert_music_main "${args[@]}"
+      ;;
+    both)
+      sort_release_dir "$current_release_dir"
+      current_release_dir="$(musicpipeline_release_target_after_sort "$current_release_dir")"
+      args=()
+      (( musicpipeline_DRY_RUN )) && args+=(--dry-run)
+      args+=("$current_release_dir")
+      convert_music_main "${args[@]}"
+      ;;
+  esac
+}
+
+musicpipeline_process_artist_targets() {
+  local mode="$1"
+  local -a artist_roots
+  local artist_root
+
+  musicpipeline_PROCESSED_ARTIST_COUNT=0
+
+  artist_roots=("${(@Qk)musicpipeline_ARTIST_TARGETS}")
+  artist_roots=("${(@o)artist_roots}")
+  for artist_root in "${artist_roots[@]}"; do
+    if [[ ! -d "$artist_root" ]]; then
+      ml_warn "skipping missing artist root: $artist_root"
+      ml_record_event "skip" "$artist_root" "" "artist root does not exist on disk" "process_artist_root"
+      continue
+    fi
+
+    (( musicpipeline_PROCESSED_ARTIST_COUNT++ ))
+    ml_log_scope "artist" "$artist_root"
+
+    case "$mode" in
+      sort)
+        musicpipeline_run_sort_for_artist "$artist_root"
+        ;;
+      convert)
+        musicpipeline_run_convert_for_artist "$artist_root"
+        ;;
+      both)
+        musicpipeline_run_sort_for_artist "$artist_root"
+        [[ -d "$artist_root" ]] && musicpipeline_run_convert_for_artist "$artist_root"
+        ;;
+    esac
+  done
+}
+
+musicpipeline_cleanup_originals() {
+  local target="$1"
+  local root_type="$2"
+  local confirm_phrase="DELETE $SOURCE_ARCHIVE_DIR"
+  local reply=""
+  local -a archive_dirs
+  local dir count=0 total_bytes=0 bytes
+
+  case "$root_type" in
+    archive_lossless|archive_lossy|batch_root|artist_root)
+      ;;
+    *)
+      ml_die "cleanup-originals requires an archive root, batch root, or artist root"
+      return 1
+      ;;
+  esac
+
+  archive_dirs=("${(@f)$(ml_find_source_archive_dirs "$target")}")
+  if (( ${#archive_dirs[@]} == 0 )); then
+    ml_log_scope "cleanup-originals" "$target"
+    ml_log "No $SOURCE_ARCHIVE_DIR directories found."
+    return 0
+  fi
+
+  ml_log_scope "cleanup-originals" "$target"
+  ml_log "This permanently deletes archived source material."
+  ml_log ""
+
+  for dir in "${archive_dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    bytes="$(ml_archive_dir_bytes "$dir")"
+    (( count++ ))
+    (( total_bytes += bytes ))
+    ml_log "  - $(ml_display_path "$dir") ($(ml_human_bytes "$bytes"))"
+  done
+
+  ml_log ""
+  ml_log "folders: $count"
+  ml_log "size:    $(ml_human_bytes "$total_bytes")"
+
+  if (( musicpipeline_DRY_RUN )); then
+    ml_log ""
+    ml_log "Dry run only. No filesystem changes were made."
+    return 0
+  fi
+
+  [[ -t 0 ]] || {
+    ml_die "cleanup-originals requires an interactive terminal confirmation"
+    return 1
+  }
+
+  ml_log ""
+  print -r -- "Type exactly: $confirm_phrase"
+  read "reply?Confirm: "
+  if [[ "$reply" != "$confirm_phrase" ]]; then
+    ml_die "confirmation did not match; aborting cleanup-originals"
+    return 1
+  fi
+
+  ml_start_run "cleanup-originals" "$target" 1
+  ml_record_event "root_type" "$target" "" "$root_type" ""
+
+  for dir in "${archive_dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    ml_log_step "delete" "$(ml_display_path "$dir")"
+    rm -rf -- "$dir"
+    ml_record_event "cleanup_originals" "$dir" "" "delete archived source tree" ""
+  done
+
+  ml_cleanup_empty_dirs "$target"
+  ml_finish_run "success" "Cleanup complete. deleted=$count size=$(ml_human_bytes "$total_bytes")"
+  MUSICLIB_RUN_ACTIVE=0
+  return 0
+}
+
+musicpipeline_main() {
+  local mode="" target="."
+  local arg script_dir root_type persist
+
+  # Reset wrapper state every time so a reused shell session does not leak old
+  # artist targets or warning counts into the next run.
+  musicpipeline_DRY_RUN=0
+  musicpipeline_KEEP_SIDECARS=0
+  musicpipeline_ARTIST_TARGETS=()
+  musicpipeline_BLOCKED_CONVERT_ARTISTS=()
+  musicpipeline_PROCESSED_ARTIST_COUNT=0
+  musicpipeline_AUDIT_WARNING_COUNT=0
+
+  if (( $# )) && [[ "$1" == (audit|sort|convert|both|undo|cleanup-originals) ]]; then
+    mode="$1"
+    shift
+  elif (( $# )) && [[ "$1" == (-h|--help) ]]; then
+    musicpipeline_usage
+    return 0
+  fi
+
+  if [[ -z "$mode" ]]; then
+    mode="$(musicpipeline_prompt_mode)" || { musicpipeline_usage; return 1; }
+  fi
+
+  # Parse top-level wrapper flags. The worker scripts handle their own argument
+  # parsing later once we know which artist roots they should touch.
+  while (( $# )); do
+    arg="$1"
+    case "$arg" in
+      --dry-run)
+        musicpipeline_DRY_RUN=1
+        ;;
+      --keep-sidecars)
+        musicpipeline_KEEP_SIDECARS=1
+        ;;
+      -h|--help)
+        musicpipeline_usage
+        return 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        ml_die "unknown option: $arg"
+        return 1
+        ;;
+      *)
+        if [[ "$target" != "." ]]; then
+          ml_die "unexpected extra argument: $arg"
+          return 1
+        fi
+        target="$arg"
+        ;;
+    esac
+    shift
+  done
+
+  (( $# == 0 )) || { ml_die "unexpected extra arguments: $*"; return 1; }
+
+  script_dir="$(ml_script_dir)"
+  [[ -d "$target" ]] || { ml_die "target directory not found: $target"; return 1; }
+  target="${target:A}"
+
+  musicpipeline_prepare_config "$script_dir" "$target"
+  root_type="$(musicpipeline_detect_root_type "$target")"
+
+  case "$mode" in
+    undo)
+      # Undo is intentionally root-scoped: you undo from the same target root
+      # that recorded the original run.
+      ml_undo_last_run "$target"
+      return $?
+      ;;
+    cleanup-originals)
+      musicpipeline_cleanup_originals "$target" "$root_type"
+      return $?
+      ;;
+    audit)
+      # Audit gets its own read-only run context so it still leaves behind a
+      # useful log/manifest without touching library files.
+      ml_start_run "audit" "$target" 1
+      ml_record_event "root_type" "$target" "" "$root_type" ""
+      case "$root_type" in
+        collection_parent)
+          musicpipeline_audit_collection_parent "$target"
+          ;;
+        archive_lossless|archive_lossy|batch_root)
+          musicpipeline_audit_batch_root "$target" "$root_type"
+          ;;
+        release_root)
+          musicpipeline_audit_release_dir "$target" "${target:h}"
+          ;;
+        artist_root)
+          musicpipeline_audit_artist_root "$target"
+          ;;
+        *)
+          musicpipeline_warn_audit "unknown target type: $target"
+          ml_record_event "skip" "$target" "" "unknown target type" "audit"
+          ;;
+      esac
+      ml_finish_run "success" "Audit complete. warnings=$musicpipeline_AUDIT_WARNING_COUNT"
+      MUSICLIB_RUN_ACTIVE=0
+      return 0
+      ;;
+  esac
+
+  case "$root_type" in
+    collection_parent)
+      # A collection parent is too broad for mutating commands. Make the user
+      # point at the actual archive root or artist root they want to change.
+      ml_die "mutating commands require an archive root or artist root, not the collection parent"
+      return 1
+      ;;
+    unknown)
+      ml_die "could not classify target root: $target"
+      return 1
+      ;;
+  esac
+
+  persist=$(( ! musicpipeline_DRY_RUN ))
+  ml_start_run "$mode" "$target" "$persist"
+  ml_record_event "root_type" "$target" "" "$root_type" ""
+
+  # First decide which artist roots need work. Only after routing settles down
+  # do we hand those artist roots to sort/convert.
+  case "$root_type" in
+    archive_lossless|archive_lossy|batch_root)
+      musicpipeline_prepare_batch_root "$target" "$root_type"
+      ;;
+    release_root)
+      musicpipeline_process_release_root "$mode" "$target"
+      ml_cleanup_empty_dirs "$target:h"
+      ml_finish_run "success" "Done. release_root_processed=1"
+      if (( musicpipeline_DRY_RUN )); then
+        ml_log "Dry run only. No filesystem changes were made."
+      fi
+      MUSICLIB_RUN_ACTIVE=0
+      return 0
+      ;;
+    artist_root)
+      musicpipeline_prepare_artist_root "$target"
+      ;;
+  esac
+
+  musicpipeline_process_artist_targets "$mode"
+  ml_cleanup_empty_dirs "$target"
+  ml_finish_run "success" "Done. artist_roots_processed=$musicpipeline_PROCESSED_ARTIST_COUNT"
+
+  if (( musicpipeline_DRY_RUN )); then
+    ml_log "Dry run only. No filesystem changes were made."
+  fi
+
+  MUSICLIB_RUN_ACTIVE=0
+}
+
+# Expose a short shell-native entrypoint when the file is sourced, but keep the
+# underlying main function around so direct script usage still works the same.
+musicpipeline() {
+  emulate -L zsh
+  musicpipeline_main "$@"
+}
+
+if [[ "${ZSH_EVAL_CONTEXT:-}" == "toplevel" ]]; then
+  musicpipeline "$@"
+fi
