@@ -70,7 +70,7 @@ sort_move_unknown_top_level_files() {
   files=("${(@f)$(find "$root" -mindepth 1 -maxdepth 1 -type f ! \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' \) | LC_ALL=C sort)}")
   for file in "${files[@]}"; do
     [[ -e "$file" ]] || continue
-    sort_move_to_unknown "$file" "$root" "unknown top-level file"
+    ml_move_misc_file "$file" "$root" "unknown top-level file" || true
   done
 }
 
@@ -276,7 +276,7 @@ sort_artist_root() {
   sort_route_loose_tracks "$artist_root"
   sort_move_unknown_top_level_files "$artist_root"
 
-  release_dirs=("${(@f)$(find "$artist_root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort)}")
+  release_dirs=("${(@f)$(find "$artist_root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$NOT_AUDIO_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort)}")
   for dir in "${release_dirs[@]}"; do
     [[ -n "$dir" ]] || continue
     kind="$(ml_dir_kind "$dir")"
@@ -289,8 +289,12 @@ sort_artist_root() {
         sort_move_to_unknown "$dir" "$artist_root" "nested artist directory"
         ;;
       *)
-        ml_warn "moving unknown directory to $UNKNOWN_DIR_NAME: $(ml_display_path "$dir")"
-        sort_move_to_unknown "$dir" "$artist_root" "unknown directory kind"
+        if ! ml_dir_has_non_special_content "$dir"; then
+          ml_log_step "skip" "housekeeping-only directory $(ml_display_path "$dir")"
+        else
+          ml_warn "moving unknown directory to $UNKNOWN_DIR_NAME: $(ml_display_path "$dir")"
+          sort_move_to_unknown "$dir" "$artist_root" "unknown directory kind"
+        fi
         ;;
     esac
   done

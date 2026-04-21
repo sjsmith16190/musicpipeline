@@ -3,7 +3,7 @@
 # Keep the common helpers reload-safe in long-lived shells. That way `source
 # ~/.zshrc` after an update actually refreshes the function set instead of
 # leaving you stuck with an older in-memory copy.
-typeset -g MUSICLIB_COMMON_FILE_VERSION="20260419.8"
+typeset -g MUSICLIB_COMMON_FILE_VERSION="20260421.1"
 if [[ "${MUSICLIB_COMMON_LOADED_VERSION:-}" == "$MUSICLIB_COMMON_FILE_VERSION" ]]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -15,12 +15,14 @@ typeset -g MUSICLIB_COMMON_LOADED_VERSION="$MUSICLIB_COMMON_FILE_VERSION"
 : ${MUSICLIB_LEGACY_SOURCE_ARCHIVE_DIR:=_SOURCE_FLAC}
 : ${MUSICLIB_CONFIG_FILENAME:=musicpipeline.config.zsh}
 : ${MUSICLIB_DEFAULT_UNKNOWN_DIR_NAME:=_Unknown}
+: ${MUSICLIB_DEFAULT_NOT_AUDIO_DIR_NAME:=_NotAudio}
 : ${MUSICLIB_DEFAULT_LOSSY_ARCHIVE_DIR_NAME:=_Lossy}
 : ${MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME:=_LossyArchive}
 
 : ${STATE_DIR_NAME:=$MUSICLIB_DEFAULT_STATE_DIR_NAME}
 : ${SOURCE_ARCHIVE_DIR:=$MUSICLIB_DEFAULT_SOURCE_ARCHIVE_DIR}
 : ${UNKNOWN_DIR_NAME:=$MUSICLIB_DEFAULT_UNKNOWN_DIR_NAME}
+: ${NOT_AUDIO_DIR_NAME:=$MUSICLIB_DEFAULT_NOT_AUDIO_DIR_NAME}
 : ${LOSSY_ARCHIVE_DIR_NAME:=$MUSICLIB_DEFAULT_LOSSY_ARCHIVE_DIR_NAME}
 
 # These globals are the little bit of shared state that lets the wrapper,
@@ -173,7 +175,7 @@ ml_path_has_hidden_or_state_segment() {
   segments=("${(@s:/:)rel}")
   for segment in "${segments[@]}"; do
     [[ -n "$segment" ]] || continue
-    if [[ "$segment" == "$STATE_DIR_NAME" || "$segment" == "$SOURCE_ARCHIVE_DIR" || "$segment" == "$UNKNOWN_DIR_NAME" || "$segment" == "$LOSSY_ARCHIVE_DIR_NAME" || "$segment" == "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" || "$segment" == .* ]]; then
+    if [[ "$segment" == "$STATE_DIR_NAME" || "$segment" == "$SOURCE_ARCHIVE_DIR" || "$segment" == "$UNKNOWN_DIR_NAME" || "$segment" == "$NOT_AUDIO_DIR_NAME" || "$segment" == "$LOSSY_ARCHIVE_DIR_NAME" || "$segment" == "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" || "$segment" == .* ]]; then
       return 0
     fi
   done
@@ -348,7 +350,7 @@ ml_root_single_primary_artist() {
   local -a direct_dirs loose_audio
   local dir kind track artist first_artist="" first_artist_key="" first_audio=""
 
-  direct_dirs=("${(@f)$(find "$root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort)}")
+  direct_dirs=("${(@f)$(find "$root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$NOT_AUDIO_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort)}")
   for dir in "${direct_dirs[@]}"; do
     [[ -n "$dir" ]] || continue
     kind="$(ml_dir_kind "$dir")"
@@ -426,7 +428,7 @@ ml_target_has_batch_content() {
   loose_audio=("${(@f)$(ml_find_loose_audio_files "$root" | LC_ALL=C sort)}")
   (( ${#loose_audio[@]} > 0 )) && return 0
 
-  direct_dirs=("${(@f)$(find "$root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort)}")
+  direct_dirs=("${(@f)$(find "$root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$NOT_AUDIO_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort)}")
   for dir in "${direct_dirs[@]}"; do
     kind="$(ml_dir_kind "$dir")"
     if [[ "$kind" == "release" || "$kind" == "artist" ]]; then
@@ -508,7 +510,7 @@ ml_sibling_lossless_root() {
 ml_find_audio_files() {
   local root="$1"
   find "$root" \
-    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
+    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$NOT_AUDIO_DIR_NAME" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
     -type f \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' \) -print
 }
 
@@ -516,6 +518,26 @@ ml_find_loose_audio_files() {
   local root="$1"
   find "$root" -mindepth 1 -maxdepth 1 -type f \
     \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' \) -print
+}
+
+ml_dir_has_non_special_content() {
+  local dir="$1"
+  find "$dir" -mindepth 1 -maxdepth 1 \
+    ! -name '.*' \
+    ! -name "$SOURCE_ARCHIVE_DIR" \
+    ! -name "$STATE_DIR_NAME" \
+    ! -name "$UNKNOWN_DIR_NAME" \
+    ! -name "$NOT_AUDIO_DIR_NAME" \
+    ! -name "$LOSSY_ARCHIVE_DIR_NAME" \
+    ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" \
+    -print -quit | grep -q .
+}
+
+ml_is_known_media_file() {
+  local ext="${1:e:l}"
+  [[ -n "$ext" ]] || return 1
+
+  [[ "$ext" == flac || "$ext" == wav || "$ext" == aiff || "$ext" == aif || "$ext" == alac || "$ext" == m4a || "$ext" == aac || "$ext" == mp3 || "$ext" == ogg || "$ext" == opus || "$ext" == wma || "$ext" == ape || "$ext" == wv || "$ext" == mka || "$ext" == dsf || "$ext" == dff || "$ext" == mp4 || "$ext" == m4v || "$ext" == mov || "$ext" == mkv || "$ext" == avi || "$ext" == jpg || "$ext" == jpeg || "$ext" == png || "$ext" == gif || "$ext" == webp || "$ext" == tif || "$ext" == tiff || "$ext" == bmp ]]
 }
 
 ml_is_lossless_extension() {
@@ -726,7 +748,7 @@ ml_dir_is_split_release() {
   local -a child_dirs
   local child signature first_signature="" matched_children=0
 
-  child_dirs=("${(@f)$(find "$dir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort)}")
+  child_dirs=("${(@f)$(find "$dir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$NOT_AUDIO_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort)}")
   for child in "${child_dirs[@]}"; do
     [[ -n "$child" ]] || continue
     [[ -n "$(ml_first_audio_file "$child")" ]] || continue
@@ -903,7 +925,7 @@ ml_dir_kind() {
   cd_audio=$(find "$dir" -mindepth 1 -maxdepth 1 -type d \( -iname 'CD *' -o -iname 'Disc *' -o -iname 'Disc*' \) | while IFS= read -r sub; do
     [[ -n "$(ml_first_audio_file "$sub")" ]] && print -r -- "$sub"
   done | wc -l | awk '{print $1}')
-  other_audio=$(find "$dir" -mindepth 1 -maxdepth 1 -type d ! \( -iname 'CD *' -o -iname 'Disc *' -o -iname 'Disc*' \) ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | while IFS= read -r sub; do
+  other_audio=$(find "$dir" -mindepth 1 -maxdepth 1 -type d ! \( -iname 'CD *' -o -iname 'Disc *' -o -iname 'Disc*' \) ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$NOT_AUDIO_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | while IFS= read -r sub; do
     [[ -n "$(ml_first_audio_file "$sub")" ]] && print -r -- "$sub"
   done | wc -l | awk '{print $1}')
 
@@ -921,7 +943,7 @@ ml_dir_kind() {
 ml_release_has_lossless_sources() {
   local dir="$1"
   find "$dir" \
-    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
+    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$NOT_AUDIO_DIR_NAME" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
     -type f \( -iname '*.flac' -o -iname '*.wav' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.alac' \) -print |
     grep -q .
 }
@@ -1064,6 +1086,53 @@ ml_move_to_unknown() {
 
   dst="$(ml_unknown_target_path "$src" "$scope_root")" || return 1
   ml_move_path "$src" "$dst" "$op" "$reason"
+}
+
+ml_not_audio_target_path() {
+  local src="$1"
+  local scope_root="$2"
+  local rel dst
+
+  [[ -n "$src" && -n "$scope_root" ]] || return 1
+  scope_root="${scope_root:A}"
+  src="${src:A}"
+
+  if [[ "$src" == "$scope_root/$NOT_AUDIO_DIR_NAME" || "$src" == "$scope_root/$NOT_AUDIO_DIR_NAME/"* ]]; then
+    return 1
+  fi
+
+  if [[ "$src" == "$scope_root/"* ]]; then
+    rel="${src#$scope_root/}"
+  else
+    rel="${src:t}"
+  fi
+
+  dst="$scope_root/$NOT_AUDIO_DIR_NAME/$rel"
+  dst="$(ml_unique_destination_path "$dst")"
+  print -r -- "$dst"
+}
+
+ml_move_to_not_audio() {
+  local src="$1"
+  local scope_root="$2"
+  local reason="${3:-non-audio content}"
+  local op="${4:-route_not_audio}"
+  local dst
+
+  dst="$(ml_not_audio_target_path "$src" "$scope_root")" || return 1
+  ml_move_path "$src" "$dst" "$op" "$reason"
+}
+
+ml_move_misc_file() {
+  local src="$1"
+  local scope_root="$2"
+  local reason="${3:-unclassified file}"
+
+  if ml_is_known_media_file "$src"; then
+    ml_move_to_unknown "$src" "$scope_root" "$reason" "route_unknown"
+  else
+    ml_move_to_not_audio "$src" "$scope_root" "$reason" "route_not_audio"
+  fi
 }
 
 ml_lossy_archive_root_for_artist_root() {
@@ -1222,7 +1291,7 @@ ml_undo_last_run() {
           ml_remove_file "$dst" "undo_remove_created" "undo created file"
         fi
         ;;
-      route_release|route_loose_track|rename_audio|move_nested_file|archive_source|quarantine_sidecar|normalize_release|route_unknown|route_lossy)
+      route_release|route_loose_track|rename_audio|move_nested_file|archive_source|restore_archived_alac|quarantine_sidecar|normalize_release|route_unknown|route_not_audio|route_lossy)
         if [[ -z "$src" || -z "$dst" ]]; then
           continue
         fi

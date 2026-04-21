@@ -171,6 +171,8 @@ Behavior:
 - renames loose singles to `[YYYY] Artist - Title [BitDepth-SampleRate].ext` when a year is available
 - flattens nested disc folders
 - quarantines `.cue`, `.log`, and `.txt` files into `.musicpipeline/trash`
+- routes unknown media files into `_Unknown`
+- routes non-media files into `_NotAudio`
 - skips conflicts instead of auto-renaming over them
 
 ### `convert`
@@ -184,6 +186,7 @@ Behavior:
 - prefers folder artwork first
 - falls back to embedded source artwork
 - archives original source files and whole converted release folders into `_originalSource`
+- leaves releases with no convertible sources in place and does not create `_originalSource` for those no-op releases
 - skips conflicting outputs instead of replacing them
 
 ### `both`

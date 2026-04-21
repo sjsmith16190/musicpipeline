@@ -292,6 +292,15 @@ convert_release_stage_dir() {
   print -r -- "${release_dir:h}/.${release_dir:t}.convert.$$.tmp"
 }
 
+convert_stage_has_outputs() {
+  local stage_dir="$1"
+  [[ -d "$stage_dir" ]] || return 1
+
+  find "$stage_dir" \
+    \( -type d \( -name "$STATE_DIR_NAME" -o -name '.*' \) -prune \) -o \
+    -type f -print -quit | grep -q .
+}
+
 convert_cue_time_to_ffmpeg() {
   local cue_time="$1"
   local total_ms hours minutes seconds frames remaining
@@ -687,7 +696,11 @@ convert_release_dir() {
   local -a source_files
 
   source_files=("${(@f)$(convert_find_release_source_files "$release_dir")}")
-  (( ${#source_files[@]} > 0 )) || return 0
+  if (( ${#source_files[@]} == 0 )); then
+    ml_log "skip: release has no convertible sources: $release_dir"
+    ml_record_event "skip" "$release_dir" "" "release has no convertible sources" "convert_release"
+    return 0
+  fi
 
   stage_dir="$(convert_release_stage_dir "$release_dir")"
   archive_dir="$archive_root/$SOURCE_ARCHIVE_DIR/${release_dir:t}"
@@ -710,6 +723,14 @@ convert_release_dir() {
       (( ! MUSICLIB_DRY_RUN )) && rm -rf -- "$stage_dir"
       return 0
     }
+  fi
+
+  if (( ! MUSICLIB_DRY_RUN )) && ! convert_stage_has_outputs "$stage_dir"; then
+    ml_warn "refusing to archive release with no staged outputs: $release_dir"
+    rm -rf -- "$stage_dir"
+    ml_record_event "skip" "$release_dir" "$archive_dir" "no converted outputs staged" "convert_release"
+    (( CONVERT_SKIP_COUNT++ ))
+    return 0
   fi
 
   convert_install_staged_release "$release_dir" "$stage_dir" "$archive_dir" || return 0

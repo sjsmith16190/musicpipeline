@@ -93,7 +93,7 @@ musicpipeline_sorted_artist_targets() {
 # root is holding artist folders, release folders, or just random clutter.
 musicpipeline_direct_child_dirs() {
   local root="$1"
-  find "$root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort
+  find "$root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$NOT_AUDIO_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort
 }
 
 musicpipeline_direct_release_dirs() {
@@ -185,15 +185,102 @@ musicpipeline_warn_audit() {
   ml_warn "$*"
 }
 
+musicpipeline_fallback_artist_name() {
+  local parent_root="$1"
+  local current_artist_root="$2"
+  local fallback=""
+
+  if [[ -n "$current_artist_root" && "${current_artist_root:A}" != "${parent_root:A}" ]]; then
+    fallback="$(ml_sanitize_name "${current_artist_root:t}")"
+  fi
+
+  print -r -- "$fallback"
+}
+
+musicpipeline_audio_tree_is_alac_only() {
+  local root="$1"
+  local -a audio_files
+  local file codec
+
+  audio_files=("${(@f)$(find "$root" \
+    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$NOT_AUDIO_DIR_NAME" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
+    -type f \( -iname '*.m4a' -o -iname '*.alac' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.mp3' -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wma' \) -print | LC_ALL=C sort)}")
+  (( ${#audio_files[@]} > 0 )) || return 1
+
+  for file in "${audio_files[@]}"; do
+    [[ -e "$file" ]] || continue
+    codec="$(ml_audio_codec "$file")"
+    [[ "$codec" == "alac" ]] || return 1
+  done
+
+  return 0
+}
+
+musicpipeline_restore_archived_alac_for_artist() {
+  local artist_root="$1"
+  local archive_root="$artist_root/$SOURCE_ARCHIVE_DIR"
+  local restored=0
+  local item dst
+  local -a archived_dirs archived_files
+  local has_non_special=1
+
+  [[ -d "$artist_root" && -d "$archive_root" ]] || return 1
+  if whence -w ml_dir_has_non_special_content >/dev/null 2>&1; then
+    ml_dir_has_non_special_content "$artist_root" && return 1
+  else
+    find "$artist_root" -mindepth 1 -maxdepth 1 \
+      ! -name '.*' \
+      ! -name "$SOURCE_ARCHIVE_DIR" \
+      ! -name "$STATE_DIR_NAME" \
+      ! -name "$UNKNOWN_DIR_NAME" \
+      ! -name "$NOT_AUDIO_DIR_NAME" \
+      ! -name "$LOSSY_ARCHIVE_DIR_NAME" \
+      ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" \
+      -print -quit | grep -q .
+    has_non_special=$?
+    (( has_non_special == 0 )) && return 1
+  fi
+
+  archived_dirs=("${(@f)$(find "$archive_root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | LC_ALL=C sort)}")
+  for item in "${archived_dirs[@]}"; do
+    [[ -d "$item" ]] || continue
+    musicpipeline_audio_tree_is_alac_only "$item" || continue
+    dst="$artist_root/${item:t}"
+    if ml_move_path "$item" "$dst" "restore_archived_alac" "restore archived ALAC release"; then
+      ml_log_step "restore" "$(ml_display_path "$item") -> $(ml_display_path "$dst")"
+      restored=1
+    fi
+  done
+
+  archived_files=("${(@f)$(find "$archive_root" -mindepth 1 -maxdepth 1 -type f \( -iname '*.m4a' -o -iname '*.alac' \) | LC_ALL=C sort)}")
+  for item in "${archived_files[@]}"; do
+    [[ -f "$item" ]] || continue
+    musicpipeline_audio_tree_is_alac_only "$item" || continue
+    dst="$artist_root/${item:t}"
+    if ml_move_path "$item" "$dst" "restore_archived_alac" "restore archived ALAC file"; then
+      ml_log_step "restore" "$(ml_display_path "$item") -> $(ml_display_path "$dst")"
+      restored=1
+    fi
+  done
+
+  (( restored )) || return 1
+  ml_cleanup_empty_dirs "$artist_root"
+  return 0
+}
+
 # Figure out which artist root a release or loose track really belongs to. In a
 # lossy archive, lossless sources get pointed at the sibling lossless root.
 musicpipeline_desired_artist_root_for_release() {
   local release_dir="$1"
   local parent_root="$2"
   local archive_type="$3"
+  local current_artist_root="${4:-}"
   local artist base_root
 
   artist="$(ml_release_primary_artist "$release_dir")"
+  if [[ -z "$artist" ]]; then
+    artist="$(musicpipeline_fallback_artist_name "$parent_root" "$current_artist_root")"
+  fi
   [[ -n "$artist" ]] || return 10
 
   base_root="$parent_root"
@@ -210,9 +297,13 @@ musicpipeline_desired_artist_root_for_track() {
   local track="$1"
   local parent_root="$2"
   local archive_type="$3"
+  local current_artist_root="${4:-}"
   local artist base_root
 
   artist="$(ml_primary_artist_from_file "$track")"
+  if [[ -z "$artist" ]]; then
+    artist="$(musicpipeline_fallback_artist_name "$parent_root" "$current_artist_root")"
+  fi
   [[ -n "$artist" ]] || return 10
 
   base_root="$parent_root"
@@ -308,7 +399,7 @@ musicpipeline_route_release_if_needed() {
   local current_artist_root="$4"
   local desired_artist_root rc release_target
 
-  desired_artist_root="$(musicpipeline_desired_artist_root_for_release "$release_dir" "$parent_root" "$archive_type")"
+  desired_artist_root="$(musicpipeline_desired_artist_root_for_release "$release_dir" "$parent_root" "$archive_type" "$current_artist_root")"
   rc=$?
   if (( rc != 0 )); then
     if [[ "${current_artist_root:A}" != "${parent_root:A}" && "$rc" == 10 ]]; then
@@ -320,6 +411,11 @@ musicpipeline_route_release_if_needed() {
   fi
 
   if musicpipeline_artist_root_matches_destination "$current_artist_root" "$parent_root" "$desired_artist_root"; then
+    return 1
+  fi
+
+  if [[ "${desired_artist_root:A}" == "${release_dir:A}" ]]; then
+    musicpipeline_register_artist "$release_dir"
     return 1
   fi
 
@@ -342,7 +438,7 @@ musicpipeline_route_track_if_needed() {
   local current_artist_root="$4"
   local desired_artist_root rc dst_file
 
-  desired_artist_root="$(musicpipeline_desired_artist_root_for_track "$track" "$parent_root" "$archive_type")"
+  desired_artist_root="$(musicpipeline_desired_artist_root_for_track "$track" "$parent_root" "$archive_type" "$current_artist_root")"
   rc=$?
   if (( rc != 0 )); then
     if [[ "${current_artist_root:A}" != "${parent_root:A}" && "$rc" == 10 ]]; then
@@ -492,7 +588,7 @@ musicpipeline_audit_track_in_context() {
   local current_artist_root="$4"
   local desired_artist_root rc normalized_track output_path missing
 
-  desired_artist_root="$(musicpipeline_desired_artist_root_for_track "$track" "$parent_root" "$archive_type")"
+  desired_artist_root="$(musicpipeline_desired_artist_root_for_track "$track" "$parent_root" "$archive_type" "$current_artist_root")"
   rc=$?
   if (( rc != 0 )); then
     if [[ "${current_artist_root:A}" != "${parent_root:A}" && "$rc" == 10 ]]; then
@@ -547,7 +643,7 @@ musicpipeline_audit_release_in_context() {
   local current_artist_root="$4"
   local desired_artist_root rc
 
-  desired_artist_root="$(musicpipeline_desired_artist_root_for_release "$release_dir" "$parent_root" "$archive_type")"
+  desired_artist_root="$(musicpipeline_desired_artist_root_for_release "$release_dir" "$parent_root" "$archive_type" "$current_artist_root")"
   rc=$?
   if (( rc != 0 )); then
     if [[ "${current_artist_root:A}" != "${parent_root:A}" && "$rc" == 10 ]]; then
@@ -668,6 +764,11 @@ musicpipeline_prepare_batch_root() {
 
   direct_dirs=("${(@f)$(musicpipeline_direct_child_dirs "$root")}")
   for dir in "${direct_dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    musicpipeline_restore_archived_alac_for_artist "$dir" || true
+  done
+  direct_dirs=("${(@f)$(musicpipeline_direct_child_dirs "$root")}")
+  for dir in "${direct_dirs[@]}"; do
     [[ -n "$dir" ]] || continue
     kind="$(ml_dir_kind "$dir")"
     [[ "$kind" == "artist" ]] && musicpipeline_register_artist "$dir"
@@ -683,7 +784,9 @@ musicpipeline_prepare_batch_root() {
       artist)
         ;;
       *)
-        if ml_move_to_unknown "$dir" "$root" "unknown top-level directory" "route_unknown"; then
+        if ! ml_dir_has_non_special_content "$dir"; then
+          ml_log_step "skip" "housekeeping-only directory $(ml_display_path "$dir")"
+        elif ml_move_to_unknown "$dir" "$root" "unknown top-level directory" "route_unknown"; then
           ml_log_step "unknown" "$(ml_display_path "$dir")"
         else
           ml_warn "skipping unknown top-level directory: $dir"
@@ -702,8 +805,12 @@ musicpipeline_prepare_batch_root() {
   loose_files=("${(@f)$(find "$root" -mindepth 1 -maxdepth 1 -type f ! \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' \) | LC_ALL=C sort)}")
   for file in "${loose_files[@]}"; do
     [[ -n "$file" ]] || continue
-    if ml_move_to_unknown "$file" "$root" "unknown top-level file" "route_unknown"; then
-      ml_log_step "unknown" "$(ml_display_path "$file")"
+    if ml_move_misc_file "$file" "$root" "unknown top-level file"; then
+      if ml_is_known_media_file "$file"; then
+        ml_log_step "unknown" "$(ml_display_path "$file")"
+      else
+        ml_log_step "not-audio" "$(ml_display_path "$file")"
+      fi
     else
       ml_warn "skipping unknown top-level file: $file"
       ml_record_event "skip" "$file" "" "unknown top-level file" "batch_root"
@@ -716,6 +823,7 @@ musicpipeline_prepare_batch_root() {
 musicpipeline_prepare_artist_root() {
   local artist_root="$1"
 
+  musicpipeline_restore_archived_alac_for_artist "$artist_root" || true
   musicpipeline_register_artist "$artist_root"
   musicpipeline_rehome_registered_artist_targets
 }
