@@ -14,10 +14,11 @@ convert_music_usage() {
   cat <<'EOF'
 Usage: convert_music.zsh [--dry-run] [artist_dir]
 
-Converts lossless source files to ALAC (.m4a) inside an artist root.
+Converts supported source files to ALAC (.m4a) or MP3 inside an artist root.
 
 Rules:
-  - converts FLAC/WAV/AIFF/AIF sources into ALAC outputs
+  - converts FLAC/WAV/AIFF/AIF and lossless WMA sources into ALAC outputs
+  - converts lossy WMA sources into MP3 outputs
   - splits single-file cue releases into per-track ALAC files
   - prefers folder artwork before embedded source artwork
   - archives original release folders and source files into _originalSource
@@ -36,7 +37,7 @@ convert_find_source_files() {
   local root="$1"
   find "$root" \
     \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" -o -name '.*' \) -prune \) -o \
-    -type f \( -iname '*.flac' -o -iname '*.wav' -o -iname '*.aiff' -o -iname '*.aif' \) -print
+    -type f \( "${MUSICLIB_CONVERT_SOURCE_FILE_FIND_ARGS[@]}" \) -print
 }
 
 convert_find_artwork_in_dir() {
@@ -80,12 +81,17 @@ convert_find_artwork_file() {
 # looks real and, if expected, actually has artwork embedded.
 convert_source_has_embedded_art() {
   local file="$1"
-  exiftool -q -q -b -Picture "$file" >/dev/null 2>&1
+  exiftool -q -q -b -Picture "$file" 2>/dev/null | head -c 1 | grep -q .
 }
 
 convert_target_has_embedded_art() {
   local file="$1"
-  exiftool -q -q -b -CoverArt "$file" >/dev/null 2>&1
+  local expected_codec="${2:-alac}"
+
+  case "$expected_codec" in
+    mp3) exiftool -q -q -b -Picture "$file" 2>/dev/null | head -c 1 | grep -q . ;;
+    *) exiftool -q -q -b -CoverArt "$file" 2>/dev/null | head -c 1 | grep -q . ;;
+  esac
 }
 
 convert_is_valid_alac() {
@@ -98,15 +104,62 @@ convert_is_valid_alac() {
   [[ "$codec" == "alac" ]]
 }
 
+convert_is_valid_mp3() {
+  local file="$1"
+  local codec
+
+  [[ -f "$file" ]] || return 1
+  codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
+    -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | head -n 1)
+  [[ "$codec" == "mp3" ]]
+}
+
 convert_verify_output() {
   local file="$1"
   local expect_art="$2"
+  local expected_codec="${3:-alac}"
 
-  convert_is_valid_alac "$file" || return 1
-  if (( expect_art )) && ! convert_target_has_embedded_art "$file"; then
+  case "$expected_codec" in
+    alac) convert_is_valid_alac "$file" || return 1 ;;
+    mp3) convert_is_valid_mp3 "$file" || return 1 ;;
+    *) return 1 ;;
+  esac
+  if (( expect_art )) && ! convert_target_has_embedded_art "$file" "$expected_codec"; then
     return 1
   fi
   return 0
+}
+
+convert_output_profile_for_source() {
+  ml_conversion_profile_for_source "$1"
+}
+
+convert_codec_args() {
+  local ffmpeg_codec="$1"
+
+  reply=(-c:a "$ffmpeg_codec")
+  case "$ffmpeg_codec" in
+    alac)
+      reply+=(-movflags use_metadata_tags)
+      ;;
+    libmp3lame)
+      reply+=(-q:a 0 -id3v2_version 3)
+      ;;
+  esac
+}
+
+convert_output_rel_path() {
+  local rel_path="$1"
+  local output_ext="$2"
+  local output_label="$3"
+  local stem="${rel_path:r}"
+
+  if [[ -n "$output_label" ]]; then
+    stem="$(printf '%s\n' "$stem" | sed -E "s/[[:space:]]+\\[[^][]+\\]\$//")"
+    stem="${stem} [$output_label]"
+  fi
+
+  print -r -- "${stem}.${output_ext}"
 }
 
 # Pull embedded art out to a temp file when we need a standalone image to feed
@@ -145,13 +198,24 @@ convert_extract_embedded_artwork() {
 convert_inject_cover_art() {
   local output_file="$1"
   local artwork_file="$2"
+  local expected_codec="${3:-alac}"
+  local -a cmd
 
   if (( MUSICLIB_DRY_RUN )); then
     ml_log "art: $artwork_file -> $output_file"
     return 0
   fi
 
-  exiftool -q -q -overwrite_original "-CoverArt<=$artwork_file" "$output_file" >/dev/null 2>&1
+  case "$expected_codec" in
+    mp3)
+      cmd=(exiftool -q -q -overwrite_original "-Picture<=$artwork_file" "$output_file")
+      ;;
+    *)
+      cmd=(exiftool -q -q -overwrite_original "-CoverArt<=$artwork_file" "$output_file")
+      ;;
+  esac
+
+  "${cmd[@]}" >/dev/null 2>&1
 }
 
 convert_metadata_args_from_values() {
@@ -193,10 +257,16 @@ convert_metadata_args_for_source_file() {
 convert_audio_only() {
   local source_file="$1"
   local temp_file="$2"
-  local -a cmd metadata_args
+  local output_ext ffmpeg_codec
+  local -a cmd metadata_args codec_args
 
   convert_metadata_args_for_source_file "$source_file"
   metadata_args=("${reply[@]}")
+  convert_output_profile_for_source "$source_file" || return 1
+  output_ext="$reply[1]"
+  ffmpeg_codec="$reply[2]"
+  convert_codec_args "$ffmpeg_codec"
+  codec_args=("${reply[@]}")
 
   cmd=(
     ffmpeg -hide_banner -loglevel error -nostdin -y
@@ -205,9 +275,8 @@ convert_audio_only() {
     -map_metadata -1
     -map_chapters -1
     "${metadata_args[@]}"
-    -c:a alac
+    "${codec_args[@]}"
     -vn
-    -movflags use_metadata_tags
     "$temp_file"
   )
 
@@ -231,10 +300,16 @@ convert_audio_segment() {
   local track="$9"
   local disc="${10}"
   local date_value="${11}"
-  local -a cmd metadata_args
+  local output_ext ffmpeg_codec
+  local -a cmd metadata_args codec_args
 
   convert_metadata_args_from_values "$artist" "$album_artist" "$album" "$title" "$track" "$disc" "$date_value"
   metadata_args=("${reply[@]}")
+  convert_output_profile_for_source "$source_file" || return 1
+  output_ext="$reply[1]"
+  ffmpeg_codec="$reply[2]"
+  convert_codec_args "$ffmpeg_codec"
+  codec_args=("${reply[@]}")
 
   cmd=(
     ffmpeg -hide_banner -loglevel error -nostdin -y
@@ -247,9 +322,8 @@ convert_audio_segment() {
     -map_metadata -1
     -map_chapters -1
     "${metadata_args[@]}"
-    -c:a alac
+    "${codec_args[@]}"
     -vn
-    -movflags use_metadata_tags
     "$temp_file"
   )
 
@@ -283,7 +357,7 @@ convert_find_release_source_files() {
 convert_find_loose_source_files() {
   local artist_root="$1"
   find "$artist_root" -mindepth 1 -maxdepth 1 -type f \
-    \( -iname '*.flac' -o -iname '*.wav' -o -iname '*.aiff' -o -iname '*.aif' \) |
+    \( "${MUSICLIB_CONVERT_SOURCE_FILE_FIND_ARGS[@]}" \) |
     LC_ALL=C sort
 }
 
@@ -427,8 +501,9 @@ convert_release_track_output_name() {
   local track_num="$1"
   local title="$2"
   local format="$3"
+  local output_ext="${4:-m4a}"
 
-  printf '01-%02d - %s [%s].m4a' "$((10#$track_num))" "$title" "$format"
+  printf '01-%02d - %s [%s].%s' "$((10#$track_num))" "$title" "$format" "$output_ext"
 }
 
 convert_process_temp_output() {
@@ -438,9 +513,11 @@ convert_process_temp_output() {
   local artwork_file="$4"
   local _extracted_art="$5"
   local expect_art="$6"
+  local expected_codec="${7:-alac}"
+  local output_label="${8:-alac}"
 
   if [[ -n "$artwork_file" ]]; then
-    convert_inject_cover_art "$temp_file" "$artwork_file" || {
+    convert_inject_cover_art "$temp_file" "$artwork_file" "$expected_codec" || {
       ml_warn "artwork embedding failed: $source_file"
       (( ! MUSICLIB_DRY_RUN )) && rm -f -- "$temp_file" "$_extracted_art"
       ml_record_event "skip" "$source_file" "$output_file" "artwork embedding failed" "convert"
@@ -450,7 +527,7 @@ convert_process_temp_output() {
   fi
 
   if ! (( MUSICLIB_DRY_RUN )); then
-    if ! convert_verify_output "$temp_file" "$expect_art"; then
+    if ! convert_verify_output "$temp_file" "$expect_art" "$expected_codec"; then
       ml_warn "verification failed for converted file: $source_file"
       rm -f -- "$temp_file" "$_extracted_art"
       ml_record_event "skip" "$source_file" "$output_file" "verification failed" "convert"
@@ -459,7 +536,7 @@ convert_process_temp_output() {
     fi
   fi
 
-  ml_record_event "convert" "$source_file" "$output_file" "created alac output" ""
+  ml_record_event "convert" "$source_file" "$output_file" "created $output_label output" ""
   (( CONVERT_CREATED_COUNT++ ))
   return 0
 }
@@ -487,6 +564,7 @@ convert_stage_regular_release() {
   local stage_dir="$2"
   local -a source_files
   local source_file rel_path output_rel output_file temp_file art_info
+  local output_ext ffmpeg_codec expected_codec output_label
   local expect_art artwork_file extracted_art
 
   source_files=("${(@f)$(convert_find_release_source_files "$release_dir")}")
@@ -497,7 +575,12 @@ convert_stage_regular_release() {
   for source_file in "${source_files[@]}"; do
     [[ -e "$source_file" ]] || continue
     rel_path="${source_file#$release_dir/}"
-    output_rel="${rel_path:r}.m4a"
+    convert_output_profile_for_source "$source_file" || continue
+    output_ext="$reply[1]"
+    ffmpeg_codec="$reply[2]"
+    expected_codec="$reply[3]"
+    output_label="$reply[4]"
+    output_rel="$(convert_output_rel_path "$rel_path" "$output_ext" "$output_label")"
     output_file="$release_dir/$output_rel"
     temp_file="$stage_dir/$output_rel"
 
@@ -523,7 +606,7 @@ convert_stage_regular_release() {
       return 1
     }
 
-    convert_process_temp_output "$temp_file" "$output_file" "$source_file" "$artwork_file" "$extracted_art" "$expect_art" || return 1
+    convert_process_temp_output "$temp_file" "$output_file" "$source_file" "$artwork_file" "$extracted_art" "$expect_art" "$expected_codec" "$output_label" || return 1
     if (( ! MUSICLIB_DRY_RUN )) && [[ -n "$extracted_art" ]]; then
       rm -f -- "$extracted_art"
     fi
@@ -540,7 +623,7 @@ convert_stage_cue_release() {
   local -a cue_lines track_numbers track_starts track_titles track_artists
   local line kind track_num track_start track_title track_artist
   local album_artist="" album_title="" album_date="0000" cue_source=""
-  local total_tracks format art_info expect_art artwork_file extracted_art
+  local total_tracks format output_ext expected_codec output_label art_info expect_art artwork_file extracted_art
   local start_time end_time output_name output_file temp_file track_artist_value track_meta
 
   cue_lines=("${(@f)$(convert_parse_cue_sheet "$cue_file")}")
@@ -574,7 +657,11 @@ convert_stage_cue_release() {
 
   total_tracks=${#track_numbers[@]}
   (( total_tracks > 0 )) || return 1
-  format="$(ml_probe_format "$source_file")"
+  convert_output_profile_for_source "$source_file" || return 1
+  output_ext="$reply[1]"
+  expected_codec="$reply[3]"
+  output_label="$reply[4]"
+  format="$output_label"
   [[ "$album_date" == "0000" ]] && album_date="$(ml_infer_year "${source_file:t}" "")"
   album_artist="$(ml_sanitize_name "${album_artist:-$(ml_primary_artist_from_file "$source_file")}")"
   album_title="$(ml_sanitize_name "${album_title:-$(ml_release_album_name "$release_dir")}")"
@@ -596,7 +683,7 @@ convert_stage_cue_release() {
       end_time=""
     fi
 
-    output_name="$(convert_release_track_output_name "$track_num" "$track_title" "$format")"
+    output_name="$(convert_release_track_output_name "$track_num" "$track_title" "$format" "$output_ext")"
     output_file="$release_dir/$output_name"
     temp_file="$stage_dir/$output_name"
     track_meta="$((10#$track_num))/$total_tracks"
@@ -613,7 +700,7 @@ convert_stage_cue_release() {
       return 1
     }
 
-    convert_process_temp_output "$temp_file" "$output_file" "$source_file" "$artwork_file" "$extracted_art" "$expect_art" || return 1
+    convert_process_temp_output "$temp_file" "$output_file" "$source_file" "$artwork_file" "$extracted_art" "$expect_art" "$expected_codec" "$output_label" || return 1
   done
 
   if (( ! MUSICLIB_DRY_RUN )) && [[ -n "$extracted_art" ]]; then
@@ -739,10 +826,16 @@ convert_release_dir() {
 convert_loose_source_file() {
   local source_file="$1"
   local artist_root="$2"
+  local output_ext expected_codec output_label
   local output_file temp_file artwork_file="" extracted_art="" expect_art=0
 
-  output_file="${$(ml_loose_track_target_path "$source_file" "$artist_root"):r}.m4a"
-  temp_file="${output_file:h}/.${output_file:t:r}.tmp.$$.m4a"
+  convert_output_profile_for_source "$source_file" || return 0
+  output_ext="$reply[1]"
+  expected_codec="$reply[3]"
+  output_label="$reply[4]"
+
+  output_file="$(convert_output_rel_path "$(ml_loose_track_target_path "$source_file" "$artist_root")" "$output_ext" "$output_label")"
+  temp_file="${output_file:h}/.${output_file:t:r}.tmp.$$.${output_ext}"
 
   artwork_file="$(convert_find_artwork_file "$source_file" "$artist_root" || true)"
   if [[ -n "$artwork_file" ]]; then
@@ -759,7 +852,7 @@ convert_loose_source_file() {
   fi
 
   if [[ -f "$output_file" ]]; then
-    if convert_verify_output "$output_file" "$expect_art"; then
+    if convert_verify_output "$output_file" "$expect_art" "$expected_codec"; then
       ml_log "skip: already converted $output_file"
       ml_record_event "skip" "$source_file" "$output_file" "already converted" "convert"
       convert_archive_source "$source_file" "$artist_root"
@@ -794,7 +887,7 @@ convert_loose_source_file() {
     artwork_file="$extracted_art"
   fi
 
-  convert_process_temp_output "$temp_file" "$output_file" "$source_file" "$artwork_file" "$extracted_art" "$expect_art" || return 0
+  convert_process_temp_output "$temp_file" "$output_file" "$source_file" "$artwork_file" "$extracted_art" "$expect_art" "$expected_codec" "$output_label" || return 0
 
   if (( ! MUSICLIB_DRY_RUN )); then
     if ! mv -- "$temp_file" "$output_file"; then

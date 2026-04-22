@@ -50,7 +50,7 @@ What it does:
 
 ## Files In This Folder
 
-- `musicpipeline.zsh`: main CLI for `audit`, `sort`, `convert`, `both`, `undo`, `delete-source`, `delete-empty-dirs`, `audio-scrape`, `dedup`, and `dedup-delete`
+- `musicpipeline.zsh`: main CLI for `audit`, `sort`, `convert`, `both`, `undo`, `delete-source`, `delete-empty-dirs`, `delete-state-dirs`, `audio-scrape`, `dedup`, and `dedup-delete`
 - `sort_music.zsh`: artist-root-only sorter
 - `convert_music.zsh`: converter for artist roots or direct release folders
 - `cleanup_music.zsh`: cleanup and deduplication commands
@@ -175,7 +175,9 @@ It reports:
 - missing metadata
 - duplicate normalized track targets
 - folder and file conflicts
-- existing ALAC outputs that would block conversion
+- existing converted outputs that would block conversion
+
+It also traverses top-level bucket directories such as `_flac`, `_alac`, `_mp3`, and nested `_Unknown` trees under batch roots instead of stopping at only already-sorted artist folders.
 
 `audit` writes a log and manifest into `.musicpipeline/runs`, but does not mutate your library files.
 
@@ -194,15 +196,18 @@ Behavior:
 - quarantines `.cue`, `.log`, and `.txt` files into `.musicpipeline/trash`
 - routes unknown media files into `_Unknown`
 - routes non-media files into `_NotAudio`
+- drains `audio-scrape` bucket directories such as `_flac` and `_alac` into the final artist/release structure
+- removes emptied bucket and `_Unknown` stubs after successful routing
 - skips conflicts instead of auto-renaming over them
 
 ### `convert`
 
-Converts eligible lossless source files to ALAC.
+Converts supported source audio to ALAC or MP3.
 
 Behavior:
 
-- converts `.flac`, `.wav`, `.aiff`, and `.aif` to `.m4a`
+- converts `.flac`, `.wav`, `.aiff`, `.aif`, and lossless WMA to ALAC `.m4a`
+- converts lossy WMA to MP3 so later sort passes label it with `[mp3]`
 - splits single-file cue-based releases into per-track `.m4a` outputs
 - prefers folder artwork first
 - falls back to embedded source artwork
@@ -214,10 +219,10 @@ Behavior:
 
 Runs:
 
-1. sort
-2. convert
+1. convert
+2. sort
 
-This is the normal command for newly downloaded lossless material.
+This is the normal command for newly downloaded material because conversion happens before lossy routing and final filename normalization.
 
 ### `undo`
 
@@ -339,26 +344,51 @@ zsh ./musicpipeline.zsh delete-empty-dirs "/path/to/LibraryRoot"
 zsh ./musicpipeline.zsh undo "/path/to/LibraryRoot"
 ```
 
+### `delete-state-dirs`
+
+Recursively finds every `.musicpipeline` directory under the chosen target root and deletes it after an interactive confirmation.
+
+Behavior:
+
+- lists the state directories it found before deleting anything
+- supports `--dry-run`
+- requires an interactive terminal
+- requires typing an exact confirmation phrase
+- is intentionally not undoable because it deletes the manifests and logs themselves
+
+Examples:
+
+```zsh
+zsh ./musicpipeline.zsh delete-state-dirs --dry-run "/path/to/LibraryRoot"
+zsh ./musicpipeline.zsh delete-state-dirs "/path/to/LibraryRoot"
+```
+
 ### `audio-scrape`
 
-Recursively finds files under the chosen target root, buckets audio by format into root-level directories such as `_mp3`, `_alac`, `_wav`, and `_flac`, and moves non-audio files into `_NotAudio`.
+Recursively finds files under the chosen target root, buckets audio by format, and routes non-audio files into `_NotAudio`.
 
 Behavior:
 
 - walks the full tree and inspects every file
-- routes audio into root-level format buckets such as `_mp3`, `_alac`, `_wav`, `_flac`, `_aiff`, `_aac`, `_ogg`, and similar buckets when those formats are present
+- routes audio into format buckets such as `_mp3`, `_alac`, `_wav`, `_flac`, `_aiff`, `_aac`, `_ogg`, `_opus`, `_wma`, and similar buckets when those formats are present
+- when tags are usable, writes into a metadata-first layout inside the bucket, for example `_<format>/Artist/[YYYY] Album [format]/track`
+- when tags are too weak to trust, preserves the source-relative path inside the bucket instead of flattening
 - routes non-audio files into `_NotAudio`
 - skips nested state/archive buckets such as `.musicpipeline`, `_originalSource`, `_Unknown`, `_NotAudio`, `_Lossy`, and existing audio bucket directories
 - resolves filename collisions safely instead of overwriting
-- removes any directories left empty after the moves
+- supports writing into a separate output root via `--output DIR`
+- defaults to copy mode when `--output DIR` is used
+- supports `--move` with `--output DIR` when you want files removed from the source tree
+- still works in-place when you omit `--output`, and that in-place mode moves files
+- removes any directories left empty after move-mode runs
 - supports `--dry-run`
-- records each move in the manifest so the run can be undone from the same target root
-- prints a summary of how many audio files were moved, the per-format bucket counts, how many non-audio files were moved, and how many empty directories were removed
+- records each move or copy in the manifest so the run can be undone from the output root used for that run
+- prints a summary of how many audio files were moved or copied, the per-format bucket counts, how many non-audio files were moved or copied, and how many empty directories were removed
 
 Notes:
 
 - it works when the target root itself is your lossy archive root, for example `~/Desktop/_Music/_Lossy`
-- audio buckets are created directly under the target root
+- audio buckets are created directly under the target root unless you supply `--output DIR`
 - `collect-mp3` still works as a legacy alias, but `audio-scrape` is the primary command name now
 
 Examples:
@@ -366,7 +396,10 @@ Examples:
 ```zsh
 zsh ./musicpipeline.zsh audio-scrape --dry-run "/path/to/LibraryRoot"
 zsh ./musicpipeline.zsh audio-scrape "/path/to/LibraryRoot"
+zsh ./musicpipeline.zsh audio-scrape --output "/path/to/ImportRoot" "/path/to/ExternalDrive"
+zsh ./musicpipeline.zsh audio-scrape --output "/path/to/ImportRoot" --move "/path/to/ExternalDrive"
 zsh ./musicpipeline.zsh undo "/path/to/LibraryRoot"
+zsh ./musicpipeline.zsh undo "/path/to/ImportRoot"
 ```
 
 ### `dedup`
@@ -381,6 +414,7 @@ Behavior:
 - supports `--dry-run`
 - records all moves in the manifest so the run can be undone from the same target root
 - prints an end-of-run summary showing each moved duplicate and the kept file it matched
+- prints the total candidate file count and an equivalent pairwise comparison count for the run
 
 Examples:
 

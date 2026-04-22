@@ -3,7 +3,7 @@
 # Keep the common helpers reload-safe in long-lived shells. That way `source
 # ~/.zshrc` after an update actually refreshes the function set instead of
 # leaving you stuck with an older in-memory copy.
-typeset -g MUSICLIB_COMMON_FILE_VERSION="20260422.3"
+typeset -g MUSICLIB_COMMON_FILE_VERSION="20260422.6"
 if [[ "${MUSICLIB_COMMON_LOADED_VERSION:-}" == "$MUSICLIB_COMMON_FILE_VERSION" ]]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -60,6 +60,31 @@ typeset -ga MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS=(
   -o -name "_dsf"
   -o -name "_dff"
 )
+typeset -ga MUSICLIB_AUDIO_FILE_FIND_ARGS=(
+  -iname '*.m4a'
+  -o -iname '*.flac'
+  -o -iname '*.alac'
+  -o -iname '*.mp3'
+  -o -iname '*.aiff'
+  -o -iname '*.aif'
+  -o -iname '*.wav'
+  -o -iname '*.wma'
+  -o -iname '*.aac'
+  -o -iname '*.ogg'
+  -o -iname '*.opus'
+  -o -iname '*.ape'
+  -o -iname '*.wv'
+  -o -iname '*.mka'
+  -o -iname '*.dsf'
+  -o -iname '*.dff'
+)
+typeset -ga MUSICLIB_CONVERT_SOURCE_FILE_FIND_ARGS=(
+  -iname '*.flac'
+  -o -iname '*.wav'
+  -o -iname '*.aiff'
+  -o -iname '*.aif'
+  -o -iname '*.wma'
+)
 
 # These globals are the little bit of shared state that lets the wrapper,
 # sorter, and converter all write to one run log/manifest when needed.
@@ -75,6 +100,8 @@ typeset -g MUSICLIB_TRASH_DIR=""
 typeset -g MUSICLIB_LOG_FILE=""
 typeset -g MUSICLIB_MANIFEST_FILE=""
 typeset -g MUSICLIB_PERSIST_STATE=0
+typeset -gi MUSICLIB_LAST_EMPTY_DIR_CLEANUP_COUNT=0
+typeset -gA MUSICLIB_TAG_ENRICH_ATTEMPTED=()
 typeset -g LOSSLESS_DIR_NAME="${LOSSLESS_DIR_NAME:-}"
 typeset -g LOSSY_DIR_NAME="${LOSSY_DIR_NAME:-}"
 
@@ -181,6 +208,17 @@ ml_sanitize_name() {
   printf '%s' "$value" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
 }
 
+ml_start_case_name() {
+  local value
+  value="$(ml_sanitize_name "${1:-}")"
+  [[ -n "$value" ]] || {
+    print -r -- ""
+    return 0
+  }
+
+  printf '%s' "$value" | perl -CS -pe 's/([[:alpha:]])([[:alpha:]]*)/\U$1\L$2/g'
+}
+
 ml_tag_value() {
   local key="$1"
   local text="$2"
@@ -216,6 +254,13 @@ ml_is_reserved_dir_name() {
   ml_is_audio_collect_dir_name "$name"
 }
 
+ml_is_cleanup_protected_dir_name() {
+  local name="$1"
+
+  [[ -n "$name" ]] || return 1
+  [[ "$name" == "$STATE_DIR_NAME" || "$name" == "$SOURCE_ARCHIVE_DIR" || "$name" == "$NOT_AUDIO_DIR_NAME" || "$name" == "$LOSSY_ARCHIVE_DIR_NAME" || "$name" == "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" || "$name" == .* ]]
+}
+
 ml_path_has_hidden_or_state_segment() {
   local path="$1"
   local base="${2:-}"
@@ -231,6 +276,50 @@ ml_path_has_hidden_or_state_segment() {
   for segment in "${segments[@]}"; do
     [[ -n "$segment" ]] || continue
     if ml_is_reserved_dir_name "$segment"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+ml_path_has_internal_skip_segment() {
+  local path="$1"
+  local base="${2:-}"
+  local rel="$path"
+  local -a segments
+  local segment
+
+  if [[ -n "$base" && "$path" == "$base/"* ]]; then
+    rel="${path#$base/}"
+  fi
+
+  segments=("${(@s:/:)rel}")
+  for segment in "${segments[@]}"; do
+    [[ -n "$segment" ]] || continue
+    if [[ "$segment" == "$STATE_DIR_NAME" || "$segment" == "$SOURCE_ARCHIVE_DIR" || "$segment" == "$NOT_AUDIO_DIR_NAME" || "$segment" == "$LOSSY_ARCHIVE_DIR_NAME" || "$segment" == "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" || "$segment" == .* ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+ml_path_has_cleanup_protected_segment() {
+  local path="$1"
+  local base="${2:-}"
+  local rel="$path"
+  local -a segments
+  local segment
+
+  if [[ -n "$base" && "$path" == "$base/"* ]]; then
+    rel="${path#$base/}"
+  fi
+
+  segments=("${(@s:/:)rel}")
+  for segment in "${segments[@]}"; do
+    [[ -n "$segment" ]] || continue
+    if ml_is_cleanup_protected_dir_name "$segment"; then
       return 0
     fi
   done
@@ -487,6 +576,13 @@ ml_target_has_batch_content() {
   loose_audio=("${(@f)$(ml_find_loose_audio_files "$root" | LC_ALL=C sort)}")
   (( ${#loose_audio[@]} > 0 )) && return 0
 
+  if find "$root" -mindepth 1 -maxdepth 1 -type d \
+    \( -name "$UNKNOWN_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" \) \
+    -print -quit | grep -q .
+  then
+    return 0
+  fi
+
   direct_dirs=("${(@f)$(ml_find_non_reserved_child_dirs "$root")}")
   for dir in "${direct_dirs[@]}"; do
     kind="$(ml_dir_kind "$dir")"
@@ -570,13 +666,13 @@ ml_find_audio_files() {
   local root="$1"
   find "$root" \
     \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$NOT_AUDIO_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
-    -type f \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' \) -print
+    -type f \( "${MUSICLIB_AUDIO_FILE_FIND_ARGS[@]}" \) -print
 }
 
 ml_find_loose_audio_files() {
   local root="$1"
   find "$root" -mindepth 1 -maxdepth 1 -type f \
-    \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' \) -print
+    \( "${MUSICLIB_AUDIO_FILE_FIND_ARGS[@]}" \) -print
 }
 
 ml_dir_has_non_special_content() {
@@ -617,6 +713,42 @@ ml_is_known_media_file() {
 ml_is_collectable_audio_file() {
   local ext="${1:e:l}"
   [[ "$ext" == flac || "$ext" == wav || "$ext" == aiff || "$ext" == aif || "$ext" == alac || "$ext" == m4a || "$ext" == aac || "$ext" == mp3 || "$ext" == ogg || "$ext" == opus || "$ext" == wma || "$ext" == ape || "$ext" == wv || "$ext" == mka || "$ext" == dsf || "$ext" == dff ]]
+}
+
+ml_relative_path_from_root() {
+  local path="$1"
+  local root="$2"
+
+  path="${path:A}"
+  root="${root:A}"
+  if [[ "$path" == "$root" ]]; then
+    print -r -- ""
+  elif [[ "$path" == "$root/"* ]]; then
+    print -r -- "${path#$root/}"
+  else
+    print -r -- "${path:t}"
+  fi
+}
+
+ml_first_nested_non_reserved_ancestor_name() {
+  local path="$1"
+  local root="$2"
+  local rel segment
+  local -a segments
+
+  rel="$(ml_relative_path_from_root "$path" "$root")"
+  [[ -n "$rel" ]] || return 1
+  segments=("${(@s:/:)rel}")
+  (( ${#segments[@]} >= 2 )) || return 1
+
+  for segment in "${segments[@]:0:$(( ${#segments[@]} - 1 ))}"; do
+    [[ -n "$segment" ]] || continue
+    ml_is_reserved_dir_name "$segment" && continue
+    print -r -- "$(ml_sanitize_name "$segment")"
+    return 0
+  done
+
+  return 1
 }
 
 ml_audio_collection_bucket_name() {
@@ -674,7 +806,55 @@ ml_audio_codec() {
 ml_audio_is_lossless_codec() {
   local codec="${1:l}"
   [[ -n "$codec" ]] || return 1
-  [[ "$codec" == alac || "$codec" == flac || "$codec" == ape || "$codec" == wavpack || "$codec" == tak || "$codec" == truehd || "$codec" == mlp || "$codec" == pcm_* ]]
+  [[ "$codec" == alac || "$codec" == flac || "$codec" == ape || "$codec" == wavpack || "$codec" == tak || "$codec" == truehd || "$codec" == mlp || "$codec" == wmalossless || "$codec" == pcm_* ]]
+}
+
+ml_is_lossless_source_file() {
+  local file="$1"
+  local codec
+
+  codec="$(ml_audio_codec "$file")"
+  if [[ -n "$codec" ]]; then
+    ml_audio_is_lossless_codec "$codec"
+    return $?
+  fi
+
+  ml_is_lossless_extension "$file"
+}
+
+ml_conversion_profile_for_source() {
+  local file="$1"
+  local codec ext output_label
+
+  codec="$(ml_audio_codec "$file")"
+  codec="${codec:l}"
+  ext="${file:e:l}"
+
+  if [[ "$codec" == "wmalossless" ]]; then
+    output_label="$(ml_probe_format "$file")"
+    reply=("m4a" "alac" "alac" "$output_label")
+    return 0
+  fi
+
+  if [[ "$ext" == "wma" || "$codec" == "wmav1" || "$codec" == "wmav2" || "$codec" == "wmapro" || "$codec" == "wmavoice" ]]; then
+    reply=("mp3" "libmp3lame" "mp3" "mp3")
+    return 0
+  fi
+
+  case "$ext" in
+    flac|wav|aiff|aif)
+      output_label="$(ml_probe_format "$file")"
+      reply=("m4a" "alac" "alac" "$output_label")
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+ml_convert_output_extension_for_source() {
+  ml_conversion_profile_for_source "$1" || return 1
+  print -r -- "$reply[1]"
 }
 
 ml_is_lossy_audio_file() {
@@ -835,19 +1015,220 @@ ml_cleanup_display_title() {
     cleaned="$(printf '%s' "$cleaned" | sed -E "s/^\\[?$year\\]?[[:space:]]*[-_.]?[[:space:]]*//")"
   fi
 
-  cleaned="$(ml_sanitize_name "$cleaned")"
-  print -r -- "${cleaned:-$title}"
+  cleaned="$(ml_start_case_name "$cleaned")"
+  print -r -- "${cleaned:-$(ml_start_case_name "$title")}"
 }
 
 ml_file_tags() {
   local file="$1"
-  ffprobe -v error -show_entries format_tags=artist,album_artist,album,title,track,disc,date \
-    -of default=noprint_wrappers=1:nokey=0 "$file" 2>/dev/null || true
+  local raw_tags inferred_tags
+
+  raw_tags="$(ffprobe -v error -show_entries format_tags=artist,album_artist,album,title,track,disc,date \
+    -of default=noprint_wrappers=1:nokey=0 "$file" 2>/dev/null || true)"
+
+  if (( ! MUSICLIB_DRY_RUN )) && [[ "${MUSICLIB_RUN_MODE:-}" == (sort|convert|both) ]] && [[ -z "${MUSICLIB_TAG_ENRICH_ATTEMPTED["$file"]:-}" ]]; then
+    ml_enrich_file_tags_if_needed "$file" "$raw_tags"
+    MUSICLIB_TAG_ENRICH_ATTEMPTED["$file"]=1
+    raw_tags="$(ffprobe -v error -show_entries format_tags=artist,album_artist,album,title,track,disc,date \
+      -of default=noprint_wrappers=1:nokey=0 "$file" 2>/dev/null || true)"
+  fi
+
+  inferred_tags="$(ml_inferred_tags_text "$file" "$raw_tags")"
+  print -r -- "$raw_tags"
+  [[ -n "$raw_tags" && -n "$inferred_tags" ]] && print
+  [[ -n "$inferred_tags" ]] && print -r -- "$inferred_tags"
 }
 
 ml_release_cue_file() {
   local dir="$1"
   find "$dir" -mindepth 1 -maxdepth 1 -type f -iname '*.cue' | LC_ALL=C sort | head -n 1
+}
+
+ml_infer_track_disc_from_path() {
+  local file="$1"
+  local basename parent_dir track_num="" disc_num=""
+
+  basename="$(ml_strip_format_suffix "${file:t:r}")"
+  if [[ "$basename" =~ '^([0-9]{2})-([0-9]{2})' ]]; then
+    disc_num="$match[1]"
+    track_num="$match[2]"
+  elif [[ "$basename" =~ '^([0-9]{1,2})[ ._-]' ]]; then
+    track_num="$match[1]"
+  fi
+
+  parent_dir="${file:h:t}"
+  if [[ -z "$disc_num" ]] && [[ "${parent_dir:l}" == cd* || "${parent_dir:l}" == disc* ]] && [[ "$parent_dir" =~ '([0-9]+)' ]]; then
+    disc_num="$match[1]"
+  fi
+
+  reply=("$track_num" "$disc_num")
+}
+
+ml_infer_album_from_path() {
+  local file="$1"
+  local dir name
+
+  dir="${file:h}"
+  name="${dir:t}"
+  if [[ "${name:l}" == cd* || "${name:l}" == disc* ]]; then
+    dir="${dir:h}"
+    name="${dir:t}"
+  fi
+  ml_is_reserved_dir_name "$name" && return 1
+  name="$(ml_strip_leading_year_prefix "$(ml_strip_format_suffix "$name")")"
+  name="$(ml_start_case_name "$name")"
+  [[ -n "$name" ]] || return 1
+  print -r -- "$name"
+}
+
+ml_infer_artist_from_path() {
+  local file="$1"
+  local dir name basename parsed_artist
+
+  dir="${file:h}"
+  name="${dir:t}"
+
+  if [[ "${name:l}" == cd* || "${name:l}" == disc* ]]; then
+    dir="${dir:h}"
+    name="${dir:t}"
+  fi
+
+  if ! ml_is_reserved_dir_name "$name"; then
+    if [[ -n "$(ml_infer_album_from_path "$file" 2>/dev/null || true)" ]]; then
+      dir="${dir:h}"
+      name="${dir:t}"
+      if [[ -n "$name" ]] && ! ml_is_reserved_dir_name "$name"; then
+        print -r -- "$(ml_path_artist_label "$name")"
+        return 0
+      fi
+    else
+      print -r -- "$(ml_path_artist_label "$name")"
+      return 0
+    fi
+  fi
+
+  basename="$(ml_strip_format_suffix "${file:t:r}")"
+  if [[ "$basename" =~ '^(.+)[[:space:]]-[[:space:]](.+)$' ]]; then
+    parsed_artist="$(ml_path_artist_label "$match[1]")"
+    [[ -n "$parsed_artist" ]] && print -r -- "$parsed_artist" && return 0
+  fi
+
+  return 1
+}
+
+ml_infer_title_from_filename() {
+  local file="$1"
+  local basename fallback inferred_artist year
+
+  basename="$(ml_strip_format_suffix "${file:t:r}")"
+  fallback="$(printf '%s\n' "$basename" | sed -E 's/^[0-9]{2}-[0-9]{2}[[:space:]]*-[[:space:]]*//; s/^[0-9]{1,2}([ ._-][[:space:]]*|[[:space:]]*-[[:space:]]*)//')"
+  inferred_artist="$(ml_infer_artist_from_path "$file" 2>/dev/null || true)"
+  year="$(ml_infer_year "$basename" "")"
+  ml_cleanup_display_title "$fallback" "$inferred_artist" "$year"
+}
+
+ml_inferred_tags_text() {
+  local file="$1"
+  local raw_tags="$2"
+  local artist album_artist album title track disc date_value
+  local inferred_artist="" inferred_album="" inferred_title="" inferred_track="" inferred_disc="" inferred_date=""
+
+  artist="$(ml_tag_value artist "$raw_tags")"
+  album_artist="$(ml_tag_value album_artist "$raw_tags")"
+  album="$(ml_tag_value album "$raw_tags")"
+  title="$(ml_tag_value title "$raw_tags")"
+  track="$(ml_tag_value track "$raw_tags")"
+  disc="$(ml_tag_value disc "$raw_tags")"
+  date_value="$(ml_tag_value date "$raw_tags")"
+
+  if [[ -z "$artist" || -z "$album_artist" ]]; then
+    inferred_artist="$(ml_infer_artist_from_path "$file" 2>/dev/null || true)"
+  fi
+  [[ -z "$album" ]] && inferred_album="$(ml_infer_album_from_path "$file" 2>/dev/null || true)"
+  [[ -z "$title" ]] && inferred_title="$(ml_infer_title_from_filename "$file" 2>/dev/null || true)"
+  if [[ -z "$track" || -z "$disc" ]]; then
+    ml_infer_track_disc_from_path "$file"
+    inferred_track="$reply[1]"
+    inferred_disc="$reply[2]"
+  fi
+  if [[ -z "$date_value" ]]; then
+    inferred_date="$(ml_infer_year "${file:h:t}" "")"
+    [[ "$inferred_date" == "0000" ]] && inferred_date="$(ml_infer_year "${file:t}" "")"
+    [[ "$inferred_date" == "0000" ]] && inferred_date=""
+  fi
+
+  if [[ -z "$artist" && -n "$inferred_artist" ]]; then
+    print -r -- "tag:artist=$inferred_artist"
+  fi
+  if [[ -z "$album_artist" && -n "$inferred_artist" && -n "${inferred_album:-$album}" ]]; then
+    print -r -- "tag:album_artist=$inferred_artist"
+  fi
+  if [[ -z "$album" && -n "$inferred_album" ]]; then
+    print -r -- "tag:album=$inferred_album"
+  fi
+  if [[ -z "$title" && -n "$inferred_title" ]]; then
+    print -r -- "tag:title=$inferred_title"
+  fi
+  if [[ -z "$track" && -n "$inferred_track" ]]; then
+    print -r -- "tag:track=$((10#$inferred_track))"
+  fi
+  if [[ -z "$disc" ]]; then
+    if [[ -n "$inferred_disc" ]]; then
+      print -r -- "tag:disc=$((10#$inferred_disc))"
+    elif [[ -n "${track:-$inferred_track}" ]]; then
+      print -r -- "tag:disc=1"
+    fi
+  fi
+  if [[ -z "$date_value" && -n "$inferred_date" ]]; then
+    print -r -- "tag:date=$inferred_date"
+  fi
+}
+
+ml_apply_tag_snapshot() {
+  local file="$1"
+  local tags_text="$2"
+  local artist album_artist album title track disc date_value
+  local -a cmd
+
+  artist="$(ml_tag_value artist "$tags_text")"
+  album_artist="$(ml_tag_value album_artist "$tags_text")"
+  album="$(ml_tag_value album "$tags_text")"
+  title="$(ml_tag_value title "$tags_text")"
+  track="$(ml_tag_value track "$tags_text")"
+  disc="$(ml_tag_value disc "$tags_text")"
+  date_value="$(ml_tag_value date "$tags_text")"
+
+  cmd=(exiftool -q -q -overwrite_original)
+  [[ -n "$artist" ]] && cmd+=("-Artist=$artist") || cmd+=(-Artist=)
+  [[ -n "$album_artist" ]] && cmd+=("-AlbumArtist=$album_artist") || cmd+=(-AlbumArtist=)
+  [[ -n "$album" ]] && cmd+=("-Album=$album") || cmd+=(-Album=)
+  [[ -n "$title" ]] && cmd+=("-Title=$title") || cmd+=(-Title=)
+  [[ -n "$track" ]] && cmd+=("-Track=$track") || cmd+=(-Track=)
+  [[ -n "$disc" ]] && cmd+=("-Disc=$disc") || cmd+=(-Disc=)
+  [[ -n "$date_value" ]] && cmd+=("-Date=$date_value") || cmd+=(-Date=)
+  cmd+=("$file")
+  "${cmd[@]}" >/dev/null 2>&1
+}
+
+ml_enrich_file_tags_if_needed() {
+  local file="$1"
+  local raw_tags="${2:-}"
+  local inferred_tags
+
+  command -v exiftool >/dev/null 2>&1 || return 0
+  [[ -n "$raw_tags" ]] || raw_tags="$(ffprobe -v error -show_entries format_tags=artist,album_artist,album,title,track,disc,date \
+    -of default=noprint_wrappers=1:nokey=0 "$file" 2>/dev/null || true)"
+  inferred_tags="$(ml_inferred_tags_text "$file" "$raw_tags")"
+  [[ -n "$inferred_tags" ]] || return 0
+
+  if ml_apply_tag_snapshot "$file" "$raw_tags"$'\n'"$inferred_tags"; then
+    ml_log_step "enrich-tags" "$(ml_display_path "$file")"
+    print -r -- "$inferred_tags" | while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      ml_log "  ${line#tag:}"
+    done
+    ml_record_event "enrich_tags" "$file" "$inferred_tags" "$raw_tags" ""
+  fi
 }
 
 ml_release_signature_for_dir() {
@@ -898,8 +1279,24 @@ ml_primary_artist_from_file() {
   tags="$(ml_file_tags "$file")"
   artist="$(ml_tag_value album_artist "$tags")"
   [[ -z "$artist" ]] && artist="$(ml_tag_value artist "$tags")"
-  artist="$(ml_sanitize_name "$artist")"
+  artist="$(ml_start_case_name "$artist")"
   print -r -- "$artist"
+}
+
+ml_artist_is_various() {
+  local artist
+  artist="$(ml_normalize_match_name "$(ml_sanitize_name "${1:-}")")"
+  [[ "$artist" == "various" || "$artist" == "various artists" || "$artist" == "va" ]]
+}
+
+ml_path_artist_label() {
+  local artist
+  artist="$(ml_sanitize_name "${1:-}")"
+  if ml_artist_is_various "$artist"; then
+    print -r -- "VA"
+  else
+    print -r -- "$(ml_start_case_name "$artist")"
+  fi
 }
 
 ml_release_primary_artist() {
@@ -919,12 +1316,12 @@ ml_release_album_name() {
   album="$(ml_tag_value album "$tags")"
   year="$(ml_infer_year "${dir:t}" "$(ml_tag_value date "$tags")")"
   fallback="$(ml_strip_leading_year_prefix "$(ml_strip_format_suffix "${dir:t}")")"
-  album="$(ml_sanitize_name "${album:-$fallback}")"
+  album="$(ml_start_case_name "${album:-$fallback}")"
   if [[ -n "$album" && "$year" != "0000" ]]; then
     album="$(printf '%s' "$album" | sed -E "s/^\\[?$year\\]?[[:space:]]*[-_.]?[[:space:]]*//")"
-    album="$(ml_sanitize_name "$album")"
+    album="$(ml_start_case_name "$album")"
   fi
-  [[ -n "$album" ]] || album="$(ml_sanitize_name "$(ml_strip_format_suffix "${dir:t}")")"
+  [[ -n "$album" ]] || album="$(ml_start_case_name "$(ml_strip_format_suffix "${dir:t}")")"
   print -r -- "$album"
 }
 
@@ -950,7 +1347,7 @@ ml_year_prefix() {
 
 ml_release_target_dir_name() {
   local dir="$1"
-  local first_audio album_name year format fallback_name year_prefix
+  local first_audio album_name year format fallback_name year_prefix artist_label
 
   first_audio="$(ml_first_audio_file "$dir")"
   [[ -n "$first_audio" ]] || {
@@ -963,11 +1360,20 @@ ml_release_target_dir_name() {
   format="$(ml_probe_format "$first_audio")"
   fallback_name="$(ml_strip_format_suffix "${dir:t}")"
   year_prefix="$(ml_year_prefix "$year")"
+  artist_label="$(ml_path_artist_label "$(ml_release_primary_artist "$dir" 2>/dev/null || true)")"
 
   if [[ -n "$album_name" ]]; then
-    print -r -- "${year_prefix}${album_name} [$format]"
+    if [[ "$artist_label" == "VA" ]]; then
+      print -r -- "${year_prefix}VA - ${album_name} [$format]"
+    else
+      print -r -- "${year_prefix}${album_name} [$format]"
+    fi
   else
-    print -r -- "${year_prefix}${fallback_name} [$format]"
+    if [[ "$artist_label" == "VA" ]]; then
+      print -r -- "${year_prefix}VA - ${fallback_name} [$format]"
+    else
+      print -r -- "${year_prefix}${fallback_name} [$format]"
+    fi
   fi
 }
 
@@ -1048,7 +1454,7 @@ ml_dir_kind() {
   local direct_audio cd_audio other_audio
 
   direct_audio=$(find "$dir" -mindepth 1 -maxdepth 1 -type f \
-    \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' \) | wc -l | awk '{print $1}')
+    \( "${MUSICLIB_AUDIO_FILE_FIND_ARGS[@]}" \) | wc -l | awk '{print $1}')
   cd_audio=$(find "$dir" -mindepth 1 -maxdepth 1 -type d \( -iname 'CD *' -o -iname 'Disc *' -o -iname 'Disc*' \) | while IFS= read -r sub; do
     [[ -n "$(ml_first_audio_file "$sub")" ]] && print -r -- "$sub"
   done | wc -l | awk '{print $1}')
@@ -1070,26 +1476,39 @@ ml_dir_kind() {
 
 ml_release_has_lossless_sources() {
   local dir="$1"
-  find "$dir" \
-    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$NOT_AUDIO_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
-    -type f \( -iname '*.flac' -o -iname '*.wav' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.alac' \) -print |
-    grep -q .
+  local -a files
+  local file
+
+  files=("${(@f)$(ml_find_audio_files "$dir" | LC_ALL=C sort)}")
+  for file in "${files[@]}"; do
+    [[ -e "$file" ]] || continue
+    if ml_is_lossless_source_file "$file"; then
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 ml_loose_track_folder_name() {
   local file="$1"
-  local tags album title date_value format year base year_prefix
+  local tags album title date_value format year base year_prefix artist_label
   tags="$(ml_file_tags "$file")"
   album="$(ml_tag_value album "$tags")"
   title="$(ml_tag_value title "$tags")"
   date_value="$(ml_tag_value date "$tags")"
   year="$(ml_infer_year "${file:t}" "$date_value")"
   format="$(ml_probe_format "$file")"
-  base="$(ml_sanitize_name "${album:-$title}")"
-  [[ -n "$album" ]] || base="$(ml_sanitize_name "${base:-${file:t:r}} - Single")"
+  base="$(ml_start_case_name "${album:-$title}")"
+  [[ -n "$album" ]] || base="$(ml_start_case_name "${base:-${file:t:r}} - Single")"
   [[ "$base" == *" - Single" ]] || [[ -n "$album" ]] || base="${base} - Single"
   year_prefix="$(ml_year_prefix "$year")"
-  print -r -- "${year_prefix}${base} [$format]"
+  artist_label="$(ml_path_artist_label "$(ml_primary_artist_from_file "$file")")"
+  if [[ "$artist_label" == "VA" ]]; then
+    print -r -- "${year_prefix}VA - ${base} [$format]"
+  else
+    print -r -- "${year_prefix}${base} [$format]"
+  fi
 }
 
 ml_loose_track_target_name() {
@@ -1110,7 +1529,7 @@ ml_loose_track_target_name() {
     artist_root_name="$(ml_sanitize_name "${artist_root:t}")"
   fi
   [[ -z "$artist" ]] && artist="$artist_root_name"
-  display_artist="$(ml_sanitize_name "$artist")"
+  display_artist="$(ml_path_artist_label "$artist")"
   title="$(ml_cleanup_display_title "$title" "${display_artist:-$artist_root_name}" "$year")"
 
   if [[ -n "$display_artist" ]]; then
@@ -1120,11 +1539,72 @@ ml_loose_track_target_name() {
   fi
 }
 
+ml_track_has_release_context() {
+  local file="$1"
+  local tags album track_value
+
+  tags="$(ml_file_tags "$file")"
+  album="$(ml_sanitize_name "$(ml_tag_value album "$tags")")"
+  track_value="$(ml_tag_value track "$tags")"
+
+  [[ -n "$album" && -n "$track_value" ]]
+}
+
 ml_loose_track_target_path() {
   local file="$1"
   local artist_root="$2"
+  local release_dir
 
-  print -r -- "$artist_root/$(ml_loose_track_target_name "$file" "$artist_root")"
+  if ml_track_has_release_context "$file"; then
+    release_dir="$artist_root/$(ml_loose_track_folder_name "$file")"
+    print -r -- "$release_dir/$(ml_track_target_name "$file")"
+  else
+    print -r -- "$artist_root/$(ml_loose_track_target_name "$file" "$artist_root")"
+  fi
+}
+
+ml_output_not_audio_target_path() {
+  local src="$1"
+  local source_root="$2"
+  local output_root="$3"
+  local rel
+
+  [[ -n "$src" && -n "$source_root" && -n "$output_root" ]] || return 1
+  rel="$(ml_relative_path_from_root "$src" "$source_root")"
+  [[ -n "$rel" ]] || rel="${src:t}"
+  print -r -- "$(ml_unique_destination_path "$output_root/$NOT_AUDIO_DIR_NAME/$rel")"
+}
+
+ml_audio_scrape_target_path() {
+  local file="$1"
+  local source_root="$2"
+  local output_root="$3"
+  local bucket artist_root release_dir album format year_prefix album_name rel
+  local tags
+
+  bucket="$(ml_audio_collection_bucket_name "$file")" || return 1
+  artist_root="$output_root/_$bucket"
+
+  artist_root="$artist_root/$(ml_primary_artist_from_file "$file")"
+  if [[ -n "${artist_root:t}" && "${artist_root:t}" != "_$bucket" ]]; then
+    tags="$(ml_file_tags "$file")"
+    album="$(ml_sanitize_name "$(ml_tag_value album "$tags")")"
+    if [[ -n "$album" ]]; then
+      format="$(ml_probe_format "$file")"
+      year_prefix="$(ml_year_prefix "$(ml_infer_year "${file:t}" "$(ml_tag_value date "$tags")")")"
+      album_name="$(ml_sanitize_name "$album")"
+      release_dir="$artist_root/${year_prefix}${album_name} [$format]"
+      print -r -- "$(ml_unique_destination_path "$release_dir/$(ml_track_target_name "$file")")"
+      return 0
+    fi
+
+    print -r -- "$(ml_unique_destination_path "$artist_root/$(ml_loose_track_target_name "$file" "$artist_root")")"
+    return 0
+  fi
+
+  rel="$(ml_relative_path_from_root "$file" "$source_root")"
+  [[ -n "$rel" ]] || rel="${file:t}"
+  print -r -- "$(ml_unique_destination_path "$output_root/_$bucket/$rel")"
 }
 
 # Filesystem mutation helpers.
@@ -1147,6 +1627,27 @@ ml_move_path() {
     ml_log_move "$op" "$src" "$dst"
   else
     mv -- "$src" "$dst"
+  fi
+  ml_record_event "$op" "$src" "$dst" "$reason" ""
+}
+
+ml_copy_file() {
+  local src="$1"
+  local dst="$2"
+  local op="${3:-copy_file}"
+  local reason="${4:-}"
+
+  if [[ -e "$dst" ]]; then
+    ml_warn "conflict: $(ml_display_path "$dst") already exists"
+    ml_record_event "skip" "$src" "$dst" "$reason" "$op"
+    return 1
+  fi
+
+  ml_ensure_dir "${dst:h}"
+  if (( MUSICLIB_DRY_RUN )); then
+    ml_log_move "$op" "$src" "$dst"
+  else
+    cp -p -- "$src" "$dst"
   fi
   ml_record_event "$op" "$src" "$dst" "$reason" ""
 }
@@ -1277,7 +1778,14 @@ ml_lossy_release_target_dir() {
 ml_lossy_track_target_path() {
   local file="$1"
   local artist_root="$2"
-  print -r -- "$(ml_lossy_archive_root_for_artist_root "$artist_root")/$(ml_loose_track_target_name "$file" "$artist_root")"
+  local lossy_artist_root
+
+  lossy_artist_root="$(ml_lossy_archive_root_for_artist_root "$artist_root")"
+  if ml_track_has_release_context "$file"; then
+    print -r -- "$lossy_artist_root/$(ml_loose_track_folder_name "$file")/$(ml_track_target_name "$file")"
+  else
+    print -r -- "$lossy_artist_root/$(ml_loose_track_target_name "$file" "$artist_root")"
+  fi
 }
 
 ml_remove_file() {
@@ -1333,6 +1841,32 @@ ml_cleanup_empty_dirs() {
   fi
 }
 
+ml_cleanup_empty_recoverable_dirs() {
+  local root="$1"
+  local dir count=0
+
+  MUSICLIB_LAST_EMPTY_DIR_CLEANUP_COUNT=0
+
+  if (( MUSICLIB_DRY_RUN )); then
+    while IFS= read -r dir; do
+      ml_path_has_cleanup_protected_segment "$dir" "$root" && continue
+      ml_log_step "rmdir" "$(ml_display_path "$dir")"
+      (( count++ ))
+    done < <(find "$root" -depth -mindepth 1 -type d -empty | LC_ALL=C sort)
+  else
+    while IFS= read -r dir; do
+      ml_path_has_cleanup_protected_segment "$dir" "$root" && continue
+      if rmdir -- "$dir" 2>/dev/null; then
+        ml_log_step "rmdir" "$(ml_display_path "$dir")"
+        ml_record_event "cleanup_empty_dir" "" "$dir" "remove empty directory" ""
+        (( count++ ))
+      fi
+    done < <(find "$root" -depth -mindepth 1 -type d -empty | LC_ALL=C sort)
+  fi
+
+  MUSICLIB_LAST_EMPTY_DIR_CLEANUP_COUNT=$count
+}
+
 ml_cleanup_empty_aux_dirs() {
   local root="$1"
   local dir
@@ -1356,6 +1890,8 @@ ml_cleanup_all_empty_dirs() {
   local root="$1"
   local dir count=0
 
+  MUSICLIB_LAST_EMPTY_DIR_CLEANUP_COUNT=0
+
   if (( MUSICLIB_DRY_RUN )); then
     while IFS= read -r dir; do
       [[ -n "$dir" ]] || continue
@@ -1373,7 +1909,7 @@ ml_cleanup_all_empty_dirs() {
     done < <(find "$root" -depth -mindepth 1 -type d -empty | LC_ALL=C sort)
   fi
 
-  print -r -- "$count"
+  MUSICLIB_LAST_EMPTY_DIR_CLEANUP_COUNT=$count
 }
 
 ml_find_dedupe_candidate_files() {
@@ -1456,7 +1992,7 @@ ml_undo_last_run() {
   local root="$1"
   local state_dir="$root/$STATE_DIR_NAME"
   local last_run_file="$state_dir/last_successful_run"
-  local manifest_file line op src_b64 dst_b64 src dst
+  local manifest_file line op src_b64 dst_b64 reason_b64 src dst reason
 
   [[ -f "$last_run_file" ]] || ml_die "no recorded successful run for $root"
   manifest_file="$(<"$last_run_file")"
@@ -1470,8 +2006,10 @@ ml_undo_last_run() {
     op="$(ml_manifest_field op "$line")"
     src_b64="$(ml_manifest_field src_b64 "$line")"
     dst_b64="$(ml_manifest_field dst_b64 "$line")"
+    reason_b64="$(ml_manifest_field reason_b64 "$line")"
     src="$(ml_b64_decode "$src_b64")"
     dst="$(ml_b64_decode "$dst_b64")"
+    reason="$(ml_b64_decode "$reason_b64")"
 
     case "$op" in
       convert)
@@ -1509,6 +2047,17 @@ ml_undo_last_run() {
           continue
         fi
         ml_move_path "$dst" "$src" "undo_move" "undo"
+        ;;
+      collect_audio_copy)
+        if [[ -n "$dst" && -e "$dst" ]]; then
+          ml_remove_file "$dst" "undo_remove_created" "undo copied file"
+        fi
+        ;;
+      enrich_tags)
+        if [[ -n "$src" && -e "$src" ]]; then
+          ml_apply_tag_snapshot "$src" "$reason"
+          ml_record_event "undo_enrich_tags" "$src" "" "undo tag enrichment" ""
+        fi
         ;;
       *)
         ;;

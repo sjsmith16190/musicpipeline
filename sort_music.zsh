@@ -35,6 +35,11 @@ typeset -gi sort_SKIP_COUNT=0
 typeset -gi sort_UNKNOWN_COUNT=0
 typeset -gi sort_LOSSY_COUNT=0
 
+sort_artist_root_is_unknown() {
+  local artist_root="$1"
+  [[ "${artist_root:t}" == "$UNKNOWN_DIR_NAME" ]]
+}
+
 sort_move_to_unknown() {
   local src="$1"
   local scope_root="$2"
@@ -67,7 +72,7 @@ sort_move_unknown_top_level_files() {
   local -a files
   local file
 
-  files=("${(@f)$(find "$root" -mindepth 1 -maxdepth 1 -type f ! \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' \) | LC_ALL=C sort)}")
+  files=("${(@f)$(find "$root" -mindepth 1 -maxdepth 1 -type f ! \( "${MUSICLIB_AUDIO_FILE_FIND_ARGS[@]}" \) | LC_ALL=C sort)}")
   for file in "${files[@]}"; do
     [[ -e "$file" ]] || continue
     ml_move_misc_file "$file" "$root" "unknown top-level file" || true
@@ -152,7 +157,7 @@ sort_move_nested_non_audio() {
 
   files=("${(@f)$(find "$release_dir" \
     \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
-    -mindepth 2 -type f ! \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' -o -iname '*.cue' -o -iname '*.log' -o -iname '*.txt' \) -print | LC_ALL=C sort)}")
+    -mindepth 2 -type f ! \( "${MUSICLIB_AUDIO_FILE_FIND_ARGS[@]}" -o -iname '*.cue' -o -iname '*.log' -o -iname '*.txt' \) -print | LC_ALL=C sort)}")
 
   for file in "${files[@]}"; do
     [[ -e "$file" ]] || continue
@@ -213,7 +218,7 @@ sort_release_dir() {
     return 0
   fi
 
-  if ml_release_has_lossy_audio "$release_dir"; then
+  if ! sort_artist_root_is_unknown "$artist_root" && ml_release_has_lossy_audio "$release_dir"; then
     if ! ml_release_has_lossless_audio "$release_dir"; then
       ml_log_step "lossy" "release $(ml_display_path "$release_dir")"
       sort_move_lossy_release "$release_dir" "$artist_root"
@@ -253,7 +258,7 @@ sort_route_loose_tracks() {
   loose_tracks=("${(@f)$(ml_find_loose_audio_files "$artist_root" | LC_ALL=C sort)}")
   for track in "${loose_tracks[@]}"; do
     [[ -e "$track" ]] || continue
-    if ml_is_lossy_audio_file "$track"; then
+    if ! sort_artist_root_is_unknown "$artist_root" && ml_is_lossy_audio_file "$track"; then
       target="$(ml_lossy_track_target_path "$track" "$artist_root")"
       sort_move_to_lossy "$track" "$target" "lossy loose track" "${artist_root:h}"
       continue

@@ -89,7 +89,8 @@ cleanup_music_delete_empty_dirs() {
   fi
 
   if whence -w ml_cleanup_all_empty_dirs >/dev/null 2>&1; then
-    removed="$(ml_cleanup_all_empty_dirs "$target")"
+    ml_cleanup_all_empty_dirs "$target"
+    removed="$MUSICLIB_LAST_EMPTY_DIR_CLEANUP_COUNT"
   else
     removed=0
     if (( MUSICLIB_DRY_RUN )); then
@@ -121,86 +122,155 @@ cleanup_music_delete_empty_dirs() {
   return 0
 }
 
-cleanup_music_collect_audio() {
+cleanup_music_delete_state_dirs() {
   local target="$1"
-  local file base dst bucket bucket_name bucket_label collect_root
+  local confirm_phrase="DELETE STATE DIRS"
+  local reply=""
+  local dir count=0 total_bytes=0 bytes
+  local -a state_dirs
+
+  state_dirs=("${(@f)$(find "$target" -type d -name "$STATE_DIR_NAME" ! -path '*/.*/*' | LC_ALL=C sort)}")
+  if (( ${#state_dirs[@]} == 0 )); then
+    ml_log_scope "delete-state-dirs" "$target"
+    ml_log "No $STATE_DIR_NAME directories found."
+    return 0
+  fi
+
+  ml_log_scope "delete-state-dirs" "$target"
+  ml_log "This permanently deletes all $STATE_DIR_NAME directories under the target."
+  ml_log ""
+
+  for dir in "${state_dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    bytes="$(ml_archive_dir_bytes "$dir")"
+    (( count++ ))
+    (( total_bytes += bytes ))
+    ml_log "  - $(ml_display_path "$dir") ($(ml_human_bytes "$bytes"))"
+  done
+
+  ml_log ""
+  ml_log "folders: $count"
+  ml_log "size:    $(ml_human_bytes "$total_bytes")"
+
+  if (( musicpipeline_DRY_RUN )); then
+    ml_log ""
+    ml_log "Dry run only. No filesystem changes were made."
+    return 0
+  fi
+
+  [[ -t 0 ]] || {
+    ml_die "delete-state-dirs requires an interactive terminal confirmation"
+    return 1
+  }
+
+  ml_log ""
+  print -r -- "Type exactly: $confirm_phrase"
+  read "reply?Confirm: "
+  if [[ "$reply" != "$confirm_phrase" ]]; then
+    ml_die "confirmation did not match; aborting delete-state-dirs"
+    return 1
+  fi
+
+  for dir in "${state_dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    ml_log_step "delete" "$(ml_display_path "$dir")"
+    rm -rf -- "$dir"
+  done
+
+  ml_log "Cleanup complete. deleted=$count size=$(ml_human_bytes "$total_bytes")"
+  return 0
+}
+
+cleanup_music_collect_audio() {
+  local source_root="$1"
+  local output_root="$2"
+  local move_mode="${3:-1}"
+  local state_root="$output_root"
+  local action_word="moved"
+  local file dst bucket bucket_name bucket_label
   local dir
   local collected_count=0 non_audio_count=0 removed_dirs=0
   local -A bucket_counts=()
+  local -a source_files=()
 
-  ml_log_scope "audio-scrape" "$target"
+  [[ -n "$source_root" ]] || return 1
+  [[ -n "$output_root" ]] || output_root="$source_root"
+  (( move_mode )) || action_word="copied"
+
+  ml_log_scope "audio-scrape" "$source_root"
+  [[ "${output_root:A}" != "${source_root:A}" ]] && ml_log "output: $(ml_display_path "$output_root")"
+  ml_log "mode:   $( (( move_mode )) && print move || print copy )"
 
   if (( ! musicpipeline_DRY_RUN )); then
-    ml_start_run "audio-scrape" "$target" 1
+    ml_start_run "audio-scrape" "$state_root" 1
+    ml_log "source: $(ml_display_path "$source_root")"
+    ml_log "output: $(ml_display_path "$output_root")"
   fi
 
-  while IFS= read -r file; do
+  source_files=("${(@f)$(find "$source_root" -type f | LC_ALL=C sort)}")
+  for file in "${source_files[@]}"; do
     [[ -f "$file" ]] || continue
-    ml_path_has_hidden_or_state_segment "$file" "$target" && continue
-    if bucket="$(ml_audio_collection_bucket_name "$file")"; then
-      collect_root="$target/_$bucket"
-      base="${file:t}"
-      dst="$collect_root/$base"
-      dst="$(ml_unique_destination_path "$dst")"
-      if ml_move_path "$file" "$dst" "collect_audio" "collect audio to root bucket _$bucket"; then
-        if (( ! MUSICLIB_DRY_RUN )); then
-          ml_log_step "audio-scrape" "$(ml_display_path "$file") -> $(ml_display_path "$dst")"
-        fi
-        (( collected_count++ ))
-        bucket_counts["$bucket"]=$(( ${bucket_counts["$bucket"]:-0} + 1 ))
-      fi
+    ml_path_has_hidden_or_state_segment "$file" "$source_root" && continue
+    if [[ "${output_root:A}" != "${source_root:A}" && "${file:A}" == "${output_root:A}/"* ]]; then
       continue
     fi
 
-    dst="$(ml_not_audio_target_path "$file" "$target")" || continue
-    if ml_move_path "$file" "$dst" "collect_audio" "collect non-audio to root not-audio bucket"; then
+    if bucket="$(ml_audio_collection_bucket_name "$file")"; then
+      dst="$(ml_audio_scrape_target_path "$file" "$source_root" "$output_root")"
+      if (( move_mode )); then
+        ml_move_path "$file" "$dst" "collect_audio" "collect audio to bucket _$bucket" || continue
+      else
+        ml_copy_file "$file" "$dst" "collect_audio_copy" "copy audio to bucket _$bucket" || continue
+      fi
       if (( ! MUSICLIB_DRY_RUN )); then
         ml_log_step "audio-scrape" "$(ml_display_path "$file") -> $(ml_display_path "$dst")"
       fi
-      (( non_audio_count++ ))
+      (( collected_count++ ))
+      bucket_counts["$bucket"]=$(( ${bucket_counts["$bucket"]:-0} + 1 ))
+      continue
     fi
-  done < <(find "$target" -type f -print | LC_ALL=C sort)
 
-  if (( musicpipeline_DRY_RUN )); then
-    while IFS= read -r dir; do
-      [[ -n "$dir" ]] || continue
-      ml_path_has_hidden_or_state_segment "$dir" "$target" && continue
-      ml_log_step "rmdir" "$(ml_display_path "$dir")"
-      (( removed_dirs++ ))
-    done < <(find "$target" -depth -mindepth 1 -type d -empty | LC_ALL=C sort)
-  else
-    while IFS= read -r dir; do
-      [[ -n "$dir" ]] || continue
-      ml_path_has_hidden_or_state_segment "$dir" "$target" && continue
-      if rmdir -- "$dir" 2>/dev/null; then
-        ml_log_step "rmdir" "$(ml_display_path "$dir")"
-        ml_record_event "cleanup_empty_dir" "" "$dir" "remove empty directory" ""
-        (( removed_dirs++ ))
-      fi
-    done < <(find "$target" -depth -mindepth 1 -type d -empty | LC_ALL=C sort)
+    dst="$(ml_output_not_audio_target_path "$file" "$source_root" "$output_root")" || continue
+    if (( move_mode )); then
+      ml_move_path "$file" "$dst" "collect_audio" "collect non-audio to _NotAudio" || continue
+    else
+      ml_copy_file "$file" "$dst" "collect_audio_copy" "copy non-audio to _NotAudio" || continue
+    fi
+    if (( ! MUSICLIB_DRY_RUN )); then
+      ml_log_step "audio-scrape" "$(ml_display_path "$file") -> $(ml_display_path "$dst")"
+    fi
+    (( non_audio_count++ ))
+  done
+
+  if (( move_mode )); then
+    ml_cleanup_empty_recoverable_dirs "$source_root"
+    removed_dirs="$MUSICLIB_LAST_EMPTY_DIR_CLEANUP_COUNT"
   fi
 
   ml_log ""
-  ml_log "Audio collection summary:"
-  ml_log "  audio files moved:   $collected_count"
+  ml_log "Audio scrape summary:"
+  ml_log "  audio files ${action_word}: ${collected_count}"
   if (( ${#bucket_counts[@]} > 0 )); then
     for bucket_name in ${(k)bucket_counts}; do
       bucket_label="${bucket_name//\"/}"
       ml_log "  bucket _${bucket_label}: ${bucket_counts[$bucket_name]}"
     done
   fi
-  ml_log "  non-audio moved:     $non_audio_count"
-  ml_log "  empty dirs removed:  $removed_dirs"
+  ml_log "  non-audio ${action_word}:  ${non_audio_count}"
+  ml_log "  output root:          $(ml_display_path "$output_root")"
+  if (( move_mode )); then
+    ml_log "  empty dirs removed:   $removed_dirs"
+  fi
 
   if (( musicpipeline_DRY_RUN )); then
     ml_log "Dry run only. No filesystem changes were made."
-    ml_log "audio files collected=$collected_count"
-    ml_log "non-audio files moved=$non_audio_count"
-    ml_log "empty directories found=$removed_dirs"
+    ml_log "audio files processed=$collected_count"
+    ml_log "non-audio files processed=$non_audio_count"
+    (( move_mode )) && ml_log "empty directories found=$removed_dirs"
     return 0
   fi
 
-  ml_finish_run "success" "Audio collection complete. audio_moved=$collected_count non_audio_moved=$non_audio_count empty_dirs_removed=$removed_dirs"
+  ml_finish_run "success" "Audio scrape complete. audio_${action_word}=$collected_count non_audio_${action_word}=$non_audio_count output=$(ml_display_path "$output_root") empty_dirs_removed=$removed_dirs"
   MUSICLIB_RUN_ACTIVE=0
   return 0
 }
@@ -211,7 +281,8 @@ cleanup_music_collect_mp3() {
 
 cleanup_music_dedup() {
   local target="$1"
-  local file hash size key dst kept duplicate_count=0
+  local file hash size key dst kept duplicate_count=0 candidate_count=0
+  local pairwise_checks=0
   local -A first_by_key=()
   local -a summary_lines=()
 
@@ -224,6 +295,7 @@ cleanup_music_dedup() {
 
   while IFS= read -r file; do
     [[ -f "$file" ]] || continue
+    (( candidate_count++ ))
     size="$(wc -c < "$file" | tr -d '[:space:]')"
     hash="$(shasum -a 256 -- "$file" | awk '{print $1}')"
     [[ -n "$hash" ]] || continue
@@ -243,6 +315,10 @@ cleanup_music_dedup() {
     fi
   done < <(ml_find_dedupe_candidate_files "$target")
 
+  if (( candidate_count > 1 )); then
+    pairwise_checks=$(( (candidate_count * (candidate_count - 1)) / 2 ))
+  fi
+
   if (( duplicate_count > 0 )); then
     ml_log ""
     ml_log "duplicates moved:"
@@ -251,6 +327,12 @@ cleanup_music_dedup() {
     done
   fi
 
+  ml_log ""
+  ml_log "Dedup summary:"
+  ml_log "  candidate files:      $candidate_count"
+  ml_log "  equivalent checks:    $pairwise_checks"
+  ml_log "  duplicates moved:     $duplicate_count"
+
   if (( musicpipeline_DRY_RUN )); then
     ml_log "Dry run only. No filesystem changes were made."
     ml_log "duplicates found=$duplicate_count"
@@ -258,7 +340,7 @@ cleanup_music_dedup() {
   fi
 
   ml_cleanup_empty_dirs "$target"
-  ml_finish_run "success" "Dedup complete. moved=$duplicate_count"
+  ml_finish_run "success" "Dedup complete. candidates=$candidate_count equivalent_checks=$pairwise_checks moved=$duplicate_count"
   MUSICLIB_RUN_ACTIVE=0
   return 0
 }
