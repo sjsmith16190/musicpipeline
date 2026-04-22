@@ -35,7 +35,7 @@ typeset -gi CONVERT_SKIP_COUNT=0
 convert_find_source_files() {
   local root="$1"
   find "$root" \
-    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name '.*' \) -prune \) -o \
+    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" -o -name '.*' \) -prune \) -o \
     -type f \( -iname '*.flac' -o -iname '*.wav' -o -iname '*.aiff' -o -iname '*.aif' \) -print
 }
 
@@ -814,7 +814,7 @@ convert_artist_root() {
   local -a release_dirs loose_sources
   local dir source_file
 
-  release_dirs=("${(@f)$(find "$artist_root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" | LC_ALL=C sort)}")
+  release_dirs=("${(@f)$(ml_find_non_reserved_child_dirs "$artist_root")}")
   for dir in "${release_dirs[@]}"; do
     [[ -d "$dir" ]] || continue
     [[ "$(ml_dir_kind "$dir")" == "release" ]] || continue

@@ -14,6 +14,7 @@ source "${${(%):-%x}:A:h}/musicpipeline_common.zsh"
 typeset -g MUSICLIB_SOURCE_ONLY=1
 source "${${(%):-%x}:A:h}/sort_music.zsh"
 source "${${(%):-%x}:A:h}/convert_music.zsh"
+source "${${(%):-%x}:A:h}/cleanup_music.zsh"
 unset MUSICLIB_SOURCE_ONLY
 
 # These associative arrays act like simple sets/maps for the current wrapper
@@ -23,11 +24,15 @@ typeset -gA musicpipeline_ARTIST_TARGETS=()
 typeset -gA musicpipeline_BLOCKED_CONVERT_ARTISTS=()
 typeset -gi musicpipeline_PROCESSED_ARTIST_COUNT=0
 typeset -gi musicpipeline_AUDIT_WARNING_COUNT=0
+typeset -g MUSICPIPELINE_UI_MODE=""
+typeset -g MUSICPIPELINE_UI_TARGET=""
+typeset -gi MUSICPIPELINE_UI_DRY_RUN=0
+typeset -gi MUSICPIPELINE_UI_KEEP_SIDECARS=0
 
 musicpipeline_usage() {
   cat <<'EOF'
-Usage: musicpipeline <audit|sort|convert|both|undo|cleanup-originals> [options] [target]
-       zsh ./musicpipeline.zsh <audit|sort|convert|both|undo|cleanup-originals> [options] [target]
+Usage: musicpipeline <audit|sort|convert|both|undo|delete-source|delete-empty-dirs|audio-scrape|dedup|dedup-delete> [options] [target]
+       zsh ./musicpipeline.zsh <audit|sort|convert|both|undo|delete-source|delete-empty-dirs|audio-scrape|dedup|dedup-delete> [options] [target]
 
 Commands:
   audit       Read-only analysis of a target root
@@ -35,7 +40,11 @@ Commands:
   convert     Convert FLAC/WAV/AIFF/AIF sources to ALAC
   both        Run conversion first, then sorts
   undo        Undo the last successful manifest-backed run for the target
-  cleanup-originals  Delete _originalSource folders after typed confirmation
+  delete-source     Delete _originalSource folders after typed confirmation
+  delete-empty-dirs Remove all completely empty directories under the target
+  audio-scrape     Bucket audio by format into root-level _mp3/_alac/_wav/... dirs
+  dedup             Move exact duplicate files into the run state area
+  dedup-delete Hard-delete stashed duplicates and matching dedup manifests
 
 Options:
   --dry-run         Log intended sort/convert changes without mutating files
@@ -50,21 +59,199 @@ EOF
 }
 
 musicpipeline_prompt_mode() {
-  local mode
+  return 1
+}
 
-  # If the user ran the wrapper with no subcommand in an interactive shell,
-  # give them a quick prompt instead of just erroring out.
-  [[ -t 0 ]] || return 1
-  print "Select mode: audit, sort, convert, both, undo, cleanup-originals"
-  read "mode?Mode: "
-  case "$mode" in
-    audit|sort|convert|both|undo|cleanup-originals)
-      print -r -- "$mode"
-      ;;
-    *)
-      return 1
-      ;;
+musicpipeline_ui_init() {
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    typeset -g MUSICPIPELINE_UI_RESET=$'\033[0m'
+    typeset -g MUSICPIPELINE_UI_DIM=$'\033[2m'
+    typeset -g MUSICPIPELINE_UI_BOLD=$'\033[1m'
+    typeset -g MUSICPIPELINE_UI_ACCENT=$'\033[38;5;45m'
+    typeset -g MUSICPIPELINE_UI_ACCENT2=$'\033[38;5;81m'
+    typeset -g MUSICPIPELINE_UI_WARN=$'\033[38;5;214m'
+    typeset -g MUSICPIPELINE_UI_MUTED=$'\033[38;5;245m'
+    typeset -g MUSICPIPELINE_UI_PANEL=$'\033[38;5;111m'
+  else
+    typeset -g MUSICPIPELINE_UI_RESET=""
+    typeset -g MUSICPIPELINE_UI_DIM=""
+    typeset -g MUSICPIPELINE_UI_BOLD=""
+    typeset -g MUSICPIPELINE_UI_ACCENT=""
+    typeset -g MUSICPIPELINE_UI_ACCENT2=""
+    typeset -g MUSICPIPELINE_UI_WARN=""
+    typeset -g MUSICPIPELINE_UI_MUTED=""
+    typeset -g MUSICPIPELINE_UI_PANEL=""
+  fi
+}
+
+musicpipeline_ui_rule() {
+  print -r -- "${MUSICPIPELINE_UI_PANEL}================================================================${MUSICPIPELINE_UI_RESET}"
+}
+
+musicpipeline_ui_soft_rule() {
+  print -r -- "${MUSICPIPELINE_UI_MUTED}----------------------------------------------------------------${MUSICPIPELINE_UI_RESET}"
+}
+
+musicpipeline_ui_print_action() {
+  local key="$1"
+  local command="$2"
+  local summary="$3"
+  printf '%s[%s]%s %-17s %s\n' "$MUSICPIPELINE_UI_ACCENT" "$key" "$MUSICPIPELINE_UI_RESET" "$command" "$summary"
+}
+
+musicpipeline_ui_usage_panel() {
+  print
+  musicpipeline_ui_rule
+  print -r -- "${MUSICPIPELINE_UI_BOLD}${MUSICPIPELINE_UI_WARN}CLI Usage Reference${MUSICPIPELINE_UI_RESET}"
+  print -r -- "${MUSICPIPELINE_UI_MUTED}Use this when you want the raw command syntax instead of the menu flow.${MUSICPIPELINE_UI_RESET}"
+  musicpipeline_ui_rule
+  musicpipeline_usage
+  musicpipeline_ui_rule
+}
+
+musicpipeline_ui_yes() {
+  local prompt="$1"
+  local reply
+  read "reply?$prompt [y/N]: "
+  [[ "${reply:l}" == y || "${reply:l}" == yes ]]
+}
+
+musicpipeline_command_summary() {
+  case "$1" in
+    audit) print -r -- "Read-only analysis of the target root." ;;
+    sort) print -r -- "Normalize structure, route files, and rename tracks." ;;
+    convert) print -r -- "Convert eligible lossless audio to ALAC." ;;
+    both) print -r -- "Run sort and convert together for a full intake pass." ;;
+    undo) print -r -- "Undo the last manifest-backed run for this exact target." ;;
+    delete-source) print -r -- "Permanently delete _originalSource trees after confirmation." ;;
+    delete-empty-dirs) print -r -- "Recursively remove completely empty directories." ;;
+    audio-scrape) print -r -- "Bucket audio by format and move non-audio into _NotAudio." ;;
+    dedup) print -r -- "Stash exact duplicate files into .musicpipeline/duplicates." ;;
+    dedup-delete) print -r -- "Permanently delete stashed duplicates and dedup manifests." ;;
+    *) print -r -- "" ;;
   esac
+}
+
+musicpipeline_terminal_ui() {
+  local choice mode target root_hint sidecar_hint
+
+  [[ -t 0 ]] || return 1
+  musicpipeline_ui_init
+
+  while :; do
+    if [[ -t 1 ]]; then
+      clear
+    fi
+    musicpipeline_ui_rule
+    print -r -- "${MUSICPIPELINE_UI_BOLD}${MUSICPIPELINE_UI_ACCENT2}Music Pipeline${MUSICPIPELINE_UI_RESET}  ${MUSICPIPELINE_UI_DIM}library intake, cleanup, and rollback${MUSICPIPELINE_UI_RESET}"
+    print -r -- "${MUSICPIPELINE_UI_MUTED}Current directory:${MUSICPIPELINE_UI_RESET} $(ml_display_path "$PWD")"
+    print -r -- "${MUSICPIPELINE_UI_MUTED}Tip:${MUSICPIPELINE_UI_RESET} Run ${MUSICPIPELINE_UI_BOLD}both${MUSICPIPELINE_UI_RESET} for a normal intake pass, ${MUSICPIPELINE_UI_BOLD}audit${MUSICPIPELINE_UI_RESET} when you want a preview first."
+    musicpipeline_ui_rule
+    print -r -- "${MUSICPIPELINE_UI_BOLD}Library Workflow${MUSICPIPELINE_UI_RESET}"
+    musicpipeline_ui_print_action "1" "audit"             "$(musicpipeline_command_summary audit)"
+    musicpipeline_ui_print_action "2" "sort"              "$(musicpipeline_command_summary sort)"
+    musicpipeline_ui_print_action "3" "convert"           "$(musicpipeline_command_summary convert)"
+    musicpipeline_ui_print_action "4" "both"              "$(musicpipeline_command_summary both)"
+    musicpipeline_ui_print_action "5" "undo"              "$(musicpipeline_command_summary undo)"
+    musicpipeline_ui_soft_rule
+    print -r -- "${MUSICPIPELINE_UI_BOLD}Library Cleanup${MUSICPIPELINE_UI_RESET}"
+    musicpipeline_ui_print_action "6" "delete-source"     "$(musicpipeline_command_summary delete-source)"
+    musicpipeline_ui_print_action "7" "delete-empty-dirs" "$(musicpipeline_command_summary delete-empty-dirs)"
+    musicpipeline_ui_soft_rule
+    print -r -- "${MUSICPIPELINE_UI_BOLD}Utilities${MUSICPIPELINE_UI_RESET}"
+    musicpipeline_ui_print_action "8" "audio-scrape"     "$(musicpipeline_command_summary audio-scrape)"
+    musicpipeline_ui_print_action "9" "dedup"             "$(musicpipeline_command_summary dedup)"
+    musicpipeline_ui_print_action "0" "dedup-delete" "$(musicpipeline_command_summary dedup-delete)"
+    musicpipeline_ui_soft_rule
+    print -r -- "${MUSICPIPELINE_UI_BOLD}Help And Exit${MUSICPIPELINE_UI_RESET}"
+    musicpipeline_ui_print_action "u" "show-usage"        "Print the full CLI usage statement."
+    musicpipeline_ui_print_action "q" "quit"              "Exit without running anything."
+    musicpipeline_ui_rule
+    print
+    read "choice?Action: "
+
+    case "${choice:l}" in
+      1) mode="audit" ;;
+      2) mode="sort" ;;
+      3) mode="convert" ;;
+      4) mode="both" ;;
+      5) mode="undo" ;;
+      6) mode="delete-source" ;;
+      7) mode="delete-empty-dirs" ;;
+      8) mode="audio-scrape" ;;
+      9) mode="dedup" ;;
+      0) mode="dedup-delete" ;;
+      u)
+        if [[ -t 1 ]]; then
+          clear
+        fi
+        musicpipeline_ui_usage_panel
+        [[ -t 0 ]] && read "choice?Press Enter to return to the menu: "
+        continue
+        ;;
+      q)
+        return 1
+        ;;
+      *)
+        print "Invalid selection."
+        continue
+        ;;
+    esac
+
+    print
+    musicpipeline_ui_rule
+    print -r -- "${MUSICPIPELINE_UI_BOLD}Selected:${MUSICPIPELINE_UI_RESET} ${MUSICPIPELINE_UI_ACCENT}$mode${MUSICPIPELINE_UI_RESET}"
+    print -r -- "$(musicpipeline_command_summary "$mode")"
+    case "$mode" in
+      audit) root_hint="Good for checking routing, naming, missing tags, and convert blockers." ;;
+      both) root_hint="Best default for newly added music under an archive or artist root." ;;
+      undo) root_hint="Must be run from the same target root that recorded the original run." ;;
+      dedup) root_hint="Only exact byte-for-byte duplicates are moved." ;;
+      audio-scrape) root_hint="Moves audio into root-level buckets like _mp3, _alac, and _wav, and routes non-audio into _NotAudio." ;;
+      dedup-delete) root_hint="This permanently removes stashed duplicates and dedup manifests." ;;
+      delete-source) root_hint="This permanently deletes archived source material under _originalSource." ;;
+      delete-empty-dirs) root_hint="Removes only completely empty folders, depth-first." ;;
+      *) root_hint="" ;;
+    esac
+    [[ -n "$root_hint" ]] && print -r -- "${MUSICPIPELINE_UI_MUTED}$root_hint${MUSICPIPELINE_UI_RESET}"
+    read "target?Target directory [.]: "
+    [[ -n "$target" ]] || target="."
+
+    MUSICPIPELINE_UI_DRY_RUN=0
+    MUSICPIPELINE_UI_KEEP_SIDECARS=0
+
+    case "$mode" in
+      audit|sort|convert|both|delete-source|delete-empty-dirs|audio-scrape|dedup|dedup-delete)
+        musicpipeline_ui_yes "Dry run?" && MUSICPIPELINE_UI_DRY_RUN=1
+        ;;
+    esac
+
+    case "$mode" in
+      sort|both)
+        sidecar_hint="Keep .cue/.log/.txt files beside the music instead of quarantining them."
+        print -r -- "${MUSICPIPELINE_UI_MUTED}$sidecar_hint${MUSICPIPELINE_UI_RESET}"
+        musicpipeline_ui_yes "Keep sidecars?" && MUSICPIPELINE_UI_KEEP_SIDECARS=1
+        ;;
+    esac
+
+    print
+    musicpipeline_ui_rule
+    print -r -- "${MUSICPIPELINE_UI_BOLD}Run Summary${MUSICPIPELINE_UI_RESET}"
+    print -r -- "  command: ${MUSICPIPELINE_UI_ACCENT}$mode${MUSICPIPELINE_UI_RESET}"
+    print -r -- "  target : ${target}"
+    print -r -- "  dry-run: $([[ $MUSICPIPELINE_UI_DRY_RUN -eq 1 ]] && print yes || print no)"
+    case "$mode" in
+      sort|both)
+        print -r -- "  sidecars: $([[ $MUSICPIPELINE_UI_KEEP_SIDECARS -eq 1 ]] && print keep || print quarantine)"
+        ;;
+    esac
+    musicpipeline_ui_rule
+    musicpipeline_ui_yes "Run this command?" || continue
+
+    MUSICPIPELINE_UI_MODE="$mode"
+    MUSICPIPELINE_UI_TARGET="$target"
+    return 0
+  done
 }
 
 musicpipeline_register_artist() {
@@ -93,7 +280,7 @@ musicpipeline_sorted_artist_targets() {
 # root is holding artist folders, release folders, or just random clutter.
 musicpipeline_direct_child_dirs() {
   local root="$1"
-  find "$root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$NOT_AUDIO_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort
+  ml_find_non_reserved_child_dirs "$root"
 }
 
 musicpipeline_direct_release_dirs() {
@@ -203,7 +390,7 @@ musicpipeline_audio_tree_is_alac_only() {
   local file codec
 
   audio_files=("${(@f)$(find "$root" \
-    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$NOT_AUDIO_DIR_NAME" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
+    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$NOT_AUDIO_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
     -type f \( -iname '*.m4a' -o -iname '*.alac' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.mp3' -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wma' \) -print | LC_ALL=C sort)}")
   (( ${#audio_files[@]} > 0 )) || return 1
 
@@ -214,6 +401,41 @@ musicpipeline_audio_tree_is_alac_only() {
   done
 
   return 0
+}
+
+musicpipeline_cleanup_empty_archive_stub() {
+  local artist_root="$1"
+  local archive_root="$artist_root/$SOURCE_ARCHIVE_DIR"
+  local has_payload=1
+
+  [[ -d "$archive_root" ]] || return 0
+
+  find "$archive_root" -mindepth 1 -maxdepth 1 \
+    ! -name '.DS_Store' \
+    ! -name '.localized' \
+    -print -quit | grep -q .
+  has_payload=$?
+  (( has_payload == 0 )) && return 0
+
+  [[ -f "$archive_root/.DS_Store" ]] && ml_remove_file "$archive_root/.DS_Store" "cleanup_archive_stub" "remove empty archive stub"
+  [[ -f "$archive_root/.localized" ]] && ml_remove_file "$archive_root/.localized" "cleanup_archive_stub" "remove empty archive stub"
+
+  if (( MUSICLIB_DRY_RUN )); then
+    ml_log_step "rmdir" "$(ml_display_path "$archive_root")"
+  else
+    rmdir -- "$archive_root" 2>/dev/null || true
+  fi
+  ml_record_event "cleanup_archive_stub" "" "$archive_root" "remove empty archive stub" ""
+
+  find "$artist_root" -mindepth 1 -maxdepth 1 -print -quit | grep -q .
+  if (( $? != 0 )); then
+    if (( MUSICLIB_DRY_RUN )); then
+      ml_log_step "rmdir" "$(ml_display_path "$artist_root")"
+    else
+      rmdir -- "$artist_root" 2>/dev/null || true
+    fi
+    ml_record_event "cleanup_archive_stub" "" "$artist_root" "remove empty artist stub" ""
+  fi
 }
 
 musicpipeline_restore_archived_alac_for_artist() {
@@ -236,7 +458,11 @@ musicpipeline_restore_archived_alac_for_artist() {
       ! -name "$NOT_AUDIO_DIR_NAME" \
       ! -name "$LOSSY_ARCHIVE_DIR_NAME" \
       ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" \
-      -print -quit | grep -q .
+      -print | while IFS= read -r dir; do
+        ml_is_audio_collect_dir_name "${dir:t}" && continue
+        print -r -- "$dir"
+        break
+      done | grep -q .
     has_non_special=$?
     (( has_non_special == 0 )) && return 1
   fi
@@ -263,9 +489,89 @@ musicpipeline_restore_archived_alac_for_artist() {
     fi
   done
 
-  (( restored )) || return 1
-  ml_cleanup_empty_dirs "$artist_root"
-  return 0
+  if (( restored )); then
+    ml_cleanup_empty_dirs "$artist_root"
+    musicpipeline_cleanup_empty_archive_stub "$artist_root"
+    return 0
+  fi
+
+  musicpipeline_cleanup_empty_archive_stub "$artist_root"
+  return 1
+}
+
+musicpipeline_path_is_under_registered_artist() {
+  local path="${1:A}"
+  local artist_root
+
+  for artist_root in "${(@Qk)musicpipeline_ARTIST_TARGETS}"; do
+    [[ -n "$artist_root" ]] || continue
+    if [[ "$path" == "${artist_root:A}/"* ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+musicpipeline_file_is_under_release_dir() {
+  local file="$1"
+  local root="${2:A}"
+  local dir="${file:h:A}"
+
+  while [[ "$dir" != "$root" && "$dir" != "/" ]]; do
+    if [[ "$(ml_dir_kind "$dir")" == "release" ]]; then
+      return 0
+    fi
+    dir="${dir:h}"
+  done
+
+  return 1
+}
+
+musicpipeline_prepare_batch_root_deep() {
+  local root="$1"
+  local archive_type="$2"
+  local progressed=0
+  local dir track file
+  local -a release_dirs loose_tracks misc_files
+
+  release_dirs=("${(@f)$(find "$root" \
+    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$NOT_AUDIO_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
+    -mindepth 2 -type d -print | awk -F/ '{ print NF "\t" $0 }' | LC_ALL=C sort -rn | cut -f2-)}")
+  for dir in "${release_dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    musicpipeline_path_is_under_registered_artist "$dir" && continue
+    [[ "$(ml_dir_kind "$dir")" == "release" ]] || continue
+    if musicpipeline_route_release_if_needed "$dir" "$root" "$archive_type" "$root"; then
+      progressed=1
+    fi
+  done
+
+  loose_tracks=("${(@f)$(find "$root" \
+    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$NOT_AUDIO_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
+    -mindepth 2 -type f \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' \) -print | LC_ALL=C sort)}")
+  for track in "${loose_tracks[@]}"; do
+    [[ -f "$track" ]] || continue
+    musicpipeline_path_is_under_registered_artist "$track" && continue
+    musicpipeline_file_is_under_release_dir "$track" "$root" && continue
+    if musicpipeline_route_track_if_needed "$track" "$root" "$archive_type" "$root"; then
+      progressed=1
+    fi
+  done
+
+  misc_files=("${(@f)$(find "$root" \
+    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$UNKNOWN_DIR_NAME" -o -name "$NOT_AUDIO_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
+    -mindepth 2 -type f ! \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' \) -print | LC_ALL=C sort)}")
+  for file in "${misc_files[@]}"; do
+    [[ -f "$file" ]] || continue
+    musicpipeline_path_is_under_registered_artist "$file" && continue
+    musicpipeline_file_is_under_release_dir "$file" "$root" && continue
+    if ml_move_misc_file "$file" "$root" "nested non-audio file"; then
+      progressed=1
+    fi
+  done
+
+  (( progressed )) && ml_cleanup_empty_dirs "$root"
 }
 
 # Figure out which artist root a release or loose track really belongs to. In a
@@ -774,6 +1080,14 @@ musicpipeline_prepare_batch_root() {
     [[ "$kind" == "artist" ]] && musicpipeline_register_artist "$dir"
   done
 
+  musicpipeline_prepare_batch_root_deep "$root" "$archive_type"
+  direct_dirs=("${(@f)$(musicpipeline_direct_child_dirs "$root")}")
+  for dir in "${direct_dirs[@]}"; do
+    [[ -n "$dir" ]] || continue
+    kind="$(ml_dir_kind "$dir")"
+    [[ "$kind" == "artist" ]] && musicpipeline_register_artist "$dir"
+  done
+
   for dir in "${direct_dirs[@]}"; do
     [[ -n "$dir" ]] || continue
     kind="$(ml_dir_kind "$dir")"
@@ -938,81 +1252,6 @@ musicpipeline_process_artist_targets() {
   done
 }
 
-musicpipeline_cleanup_originals() {
-  local target="$1"
-  local root_type="$2"
-  local confirm_phrase="DELETE $SOURCE_ARCHIVE_DIR"
-  local reply=""
-  local -a archive_dirs
-  local dir count=0 total_bytes=0 bytes
-
-  case "$root_type" in
-    archive_lossless|archive_lossy|batch_root|artist_root)
-      ;;
-    *)
-      ml_die "cleanup-originals requires an archive root, batch root, or artist root"
-      return 1
-      ;;
-  esac
-
-  archive_dirs=("${(@f)$(ml_find_source_archive_dirs "$target")}")
-  if (( ${#archive_dirs[@]} == 0 )); then
-    ml_log_scope "cleanup-originals" "$target"
-    ml_log "No $SOURCE_ARCHIVE_DIR directories found."
-    return 0
-  fi
-
-  ml_log_scope "cleanup-originals" "$target"
-  ml_log "This permanently deletes archived source material."
-  ml_log ""
-
-  for dir in "${archive_dirs[@]}"; do
-    [[ -d "$dir" ]] || continue
-    bytes="$(ml_archive_dir_bytes "$dir")"
-    (( count++ ))
-    (( total_bytes += bytes ))
-    ml_log "  - $(ml_display_path "$dir") ($(ml_human_bytes "$bytes"))"
-  done
-
-  ml_log ""
-  ml_log "folders: $count"
-  ml_log "size:    $(ml_human_bytes "$total_bytes")"
-
-  if (( musicpipeline_DRY_RUN )); then
-    ml_log ""
-    ml_log "Dry run only. No filesystem changes were made."
-    return 0
-  fi
-
-  [[ -t 0 ]] || {
-    ml_die "cleanup-originals requires an interactive terminal confirmation"
-    return 1
-  }
-
-  ml_log ""
-  print -r -- "Type exactly: $confirm_phrase"
-  read "reply?Confirm: "
-  if [[ "$reply" != "$confirm_phrase" ]]; then
-    ml_die "confirmation did not match; aborting cleanup-originals"
-    return 1
-  fi
-
-  ml_start_run "cleanup-originals" "$target" 1
-  ml_record_event "root_type" "$target" "" "$root_type" ""
-
-  for dir in "${archive_dirs[@]}"; do
-    [[ -d "$dir" ]] || continue
-    ml_log_step "delete" "$(ml_display_path "$dir")"
-    rm -rf -- "$dir"
-    ml_record_event "cleanup_originals" "$dir" "" "delete archived source tree" ""
-  done
-
-  ml_cleanup_empty_dirs "$target"
-  ml_finish_run "success" "Cleanup complete. deleted=$count size=$(ml_human_bytes "$total_bytes")"
-  MUSICLIB_RUN_ACTIVE=0
-  return 0
-}
-
 musicpipeline_main() {
   local mode="" target="."
   local arg script_dir root_type persist
@@ -1025,8 +1264,12 @@ musicpipeline_main() {
   musicpipeline_BLOCKED_CONVERT_ARTISTS=()
   musicpipeline_PROCESSED_ARTIST_COUNT=0
   musicpipeline_AUDIT_WARNING_COUNT=0
+  MUSICPIPELINE_UI_MODE=""
+  MUSICPIPELINE_UI_TARGET=""
+  MUSICPIPELINE_UI_DRY_RUN=0
+  MUSICPIPELINE_UI_KEEP_SIDECARS=0
 
-  if (( $# )) && [[ "$1" == (audit|sort|convert|both|undo|cleanup-originals) ]]; then
+  if (( $# )) && [[ "$1" == (audit|sort|convert|both|undo|delete-source|delete-empty-dirs|audio-scrape|collect-mp3|dedup|dedup-delete) ]]; then
     mode="$1"
     shift
   elif (( $# )) && [[ "$1" == (-h|--help) ]]; then
@@ -1035,7 +1278,11 @@ musicpipeline_main() {
   fi
 
   if [[ -z "$mode" ]]; then
-    mode="$(musicpipeline_prompt_mode)" || { musicpipeline_usage; return 1; }
+    musicpipeline_terminal_ui || { musicpipeline_usage; return 1; }
+    mode="$MUSICPIPELINE_UI_MODE"
+    target="$MUSICPIPELINE_UI_TARGET"
+    musicpipeline_DRY_RUN=$MUSICPIPELINE_UI_DRY_RUN
+    musicpipeline_KEEP_SIDECARS=$MUSICPIPELINE_UI_KEEP_SIDECARS
   fi
 
   # Parse top-level wrapper flags. The worker scripts handle their own argument
@@ -1077,6 +1324,8 @@ musicpipeline_main() {
   script_dir="$(ml_script_dir)"
   [[ -d "$target" ]] || { ml_die "target directory not found: $target"; return 1; }
   target="${target:A}"
+  MUSICLIB_DRY_RUN=$musicpipeline_DRY_RUN
+  MUSICLIB_KEEP_SIDECARS=$musicpipeline_KEEP_SIDECARS
 
   musicpipeline_prepare_config "$script_dir" "$target"
   root_type="$(musicpipeline_detect_root_type "$target")"
@@ -1088,8 +1337,24 @@ musicpipeline_main() {
       ml_undo_last_run "$target"
       return $?
       ;;
-    cleanup-originals)
-      musicpipeline_cleanup_originals "$target" "$root_type"
+    delete-source)
+      cleanup_music_delete_source "$target" "$root_type"
+      return $?
+      ;;
+    delete-empty-dirs)
+      cleanup_music_delete_empty_dirs "$target"
+      return $?
+      ;;
+    audio-scrape|collect-mp3)
+      cleanup_music_collect_audio "$target"
+      return $?
+      ;;
+    dedup)
+      cleanup_music_dedup "$target"
+      return $?
+      ;;
+    dedup-delete)
+      cleanup_music_delete_duplicates "$target"
       return $?
       ;;
     audit)

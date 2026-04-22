@@ -7,32 +7,53 @@ This folder contains a `zsh` toolkit for auditing, organizing, converting, and r
 
 The main entrypoint is `musicpipeline.zsh`.
 
+Running `musicpipeline` with no arguments opens an interactive terminal UI with grouped actions, inline summaries, and a built-in usage/help view.
+
 ## Quick Start
 
-1. Put newly downloaded music into either your lossless archive root or your lossy archive root.
-2. Run an audit first:
+1. Launch the terminal UI if you want a guided flow:
+
+```zsh
+musicpipeline
+```
+
+2. Put newly downloaded music into either your lossless archive root or your lossy archive root.
+3. Run an audit first:
 
 ```zsh
 zsh ./musicpipeline.zsh audit "/path/to/Collection"
 ```
 
-3. Run the full workflow on the archive root that actually contains the intake:
+4. Run the full workflow on the archive root that actually contains the intake:
 
 ```zsh
 zsh ./musicpipeline.zsh both "/path/to/Lossy"
 ```
 
-4. If you need to roll back that run, undo it from the same target root:
+5. If you need to roll back that run, undo it from the same target root:
 
 ```zsh
 zsh ./musicpipeline.zsh undo "/path/to/Lossy"
 ```
 
+## Interactive UI
+
+If you run `musicpipeline` with no command, it opens a terminal launcher instead of immediately printing usage text.
+
+What it does:
+
+- clears the terminal before drawing the menu
+- groups core workflow actions, cleanup actions, and help/exit separately
+- shows a short summary for each action
+- lets you open the full CLI usage statement inside a highlighted help panel
+- prompts for target, `--dry-run`, and `--keep-sidecars` where relevant
+
 ## Files In This Folder
 
-- `musicpipeline.zsh`: main CLI for `audit`, `sort`, `convert`, `both`, `undo`, and `cleanup-originals`
+- `musicpipeline.zsh`: main CLI for `audit`, `sort`, `convert`, `both`, `undo`, `delete-source`, `delete-empty-dirs`, `audio-scrape`, `dedup`, and `dedup-delete`
 - `sort_music.zsh`: artist-root-only sorter
 - `convert_music.zsh`: converter for artist roots or direct release folders
+- `cleanup_music.zsh`: cleanup and deduplication commands
 - `musicpipeline_youtube.zsh`: sourceable `musicpipelineyt` helper for native-source YouTube audio downloads
 - `musicpipeline_common.zsh`: shared helper library
 - `musicpipeline.config.zsh`: optional local config file for archive-aware routing
@@ -281,7 +302,7 @@ Important undo scope rule:
 - if you ran `both` on `Lossy`, undo from `Lossy`
 - `undo` is only for the last successful run on that target
 
-### `cleanup-originals`
+### `delete-source`
 
 Deletes every `_originalSource` directory under the chosen archive root, batch root, or artist root.
 
@@ -295,8 +316,97 @@ Safety behavior:
 Examples:
 
 ```zsh
-zsh ./musicpipeline.zsh cleanup-originals --dry-run "/path/to/Lossless"
-zsh ./musicpipeline.zsh cleanup-originals "/path/to/Lossless"
+zsh ./musicpipeline.zsh delete-source --dry-run "/path/to/Lossless"
+zsh ./musicpipeline.zsh delete-source "/path/to/Lossless"
+```
+
+### `delete-empty-dirs`
+
+Recursively removes every completely empty directory under the chosen target root.
+
+Behavior:
+
+- walks the full tree depth-first
+- removes only directories that are actually empty
+- supports `--dry-run` for previewing the removals
+- records each removed directory in the manifest so the run can be undone from the same target root
+
+Examples:
+
+```zsh
+zsh ./musicpipeline.zsh delete-empty-dirs --dry-run "/path/to/LibraryRoot"
+zsh ./musicpipeline.zsh delete-empty-dirs "/path/to/LibraryRoot"
+zsh ./musicpipeline.zsh undo "/path/to/LibraryRoot"
+```
+
+### `audio-scrape`
+
+Recursively finds files under the chosen target root, buckets audio by format into root-level directories such as `_mp3`, `_alac`, `_wav`, and `_flac`, and moves non-audio files into `_NotAudio`.
+
+Behavior:
+
+- walks the full tree and inspects every file
+- routes audio into root-level format buckets such as `_mp3`, `_alac`, `_wav`, `_flac`, `_aiff`, `_aac`, `_ogg`, and similar buckets when those formats are present
+- routes non-audio files into `_NotAudio`
+- skips nested state/archive buckets such as `.musicpipeline`, `_originalSource`, `_Unknown`, `_NotAudio`, `_Lossy`, and existing audio bucket directories
+- resolves filename collisions safely instead of overwriting
+- removes any directories left empty after the moves
+- supports `--dry-run`
+- records each move in the manifest so the run can be undone from the same target root
+- prints a summary of how many audio files were moved, the per-format bucket counts, how many non-audio files were moved, and how many empty directories were removed
+
+Notes:
+
+- it works when the target root itself is your lossy archive root, for example `~/Desktop/_Music/_Lossy`
+- audio buckets are created directly under the target root
+- `collect-mp3` still works as a legacy alias, but `audio-scrape` is the primary command name now
+
+Examples:
+
+```zsh
+zsh ./musicpipeline.zsh audio-scrape --dry-run "/path/to/LibraryRoot"
+zsh ./musicpipeline.zsh audio-scrape "/path/to/LibraryRoot"
+zsh ./musicpipeline.zsh undo "/path/to/LibraryRoot"
+```
+
+### `dedup`
+
+Finds exact byte-for-byte duplicate files under the chosen target root and moves the later copies into the run state area instead of deleting them outright.
+
+Behavior:
+
+- hashes candidate files with SHA-256
+- keeps the first path seen for a given file content
+- moves later duplicates into `.musicpipeline/duplicates/<run-id>/...`
+- supports `--dry-run`
+- records all moves in the manifest so the run can be undone from the same target root
+- prints an end-of-run summary showing each moved duplicate and the kept file it matched
+
+Examples:
+
+```zsh
+zsh ./musicpipeline.zsh dedup --dry-run "/path/to/LibraryRoot"
+zsh ./musicpipeline.zsh dedup "/path/to/LibraryRoot"
+zsh ./musicpipeline.zsh undo "/path/to/LibraryRoot"
+```
+
+### `dedup-delete`
+
+Permanently deletes the stashed duplicate trees created by `dedup` and removes the matching dedup manifest/log files so those runs can no longer be undone.
+
+Behavior:
+
+- lists the duplicate stash trees before deleting anything
+- supports `--dry-run`
+- requires an interactive terminal
+- requires typing an exact confirmation phrase
+- clears `last_successful_run` if it points at one of the deleted dedup manifests
+
+Examples:
+
+```zsh
+zsh ./musicpipeline.zsh dedup-delete --dry-run "/path/to/LibraryRoot"
+zsh ./musicpipeline.zsh dedup-delete "/path/to/LibraryRoot"
 ```
 
 ## Wrapper vs Direct Scripts

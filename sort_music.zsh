@@ -129,7 +129,7 @@ sort_quarantine_sidecars() {
   (( MUSICLIB_KEEP_SIDECARS )) && return 0
 
   files=("${(@f)$(find "$release_dir" \
-    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
+    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
     -type f \( -iname '*.cue' -o -iname '*.log' -o -iname '*.txt' \) -print | LC_ALL=C sort)}")
 
   for file in "${files[@]}"; do
@@ -151,7 +151,7 @@ sort_move_nested_non_audio() {
   local file rel_dir prefix target
 
   files=("${(@f)$(find "$release_dir" \
-    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
+    \( -type d \( -name "$SOURCE_ARCHIVE_DIR" -o -name "$STATE_DIR_NAME" -o "${MUSICLIB_AUDIO_COLLECT_DIR_FIND_ARGS[@]}" -o -name "$LOSSY_ARCHIVE_DIR_NAME" -o -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" -o -name '.*' \) -prune \) -o \
     -mindepth 2 -type f ! \( -iname '*.m4a' -o -iname '*.flac' -o -iname '*.alac' -o -iname '*.mp3' -o -iname '*.aiff' -o -iname '*.aif' -o -iname '*.wav' -o -iname '*.cue' -o -iname '*.log' -o -iname '*.txt' \) -print | LC_ALL=C sort)}")
 
   for file in "${files[@]}"; do
@@ -276,7 +276,7 @@ sort_artist_root() {
   sort_route_loose_tracks "$artist_root"
   sort_move_unknown_top_level_files "$artist_root"
 
-  release_dirs=("${(@f)$(find "$artist_root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$SOURCE_ARCHIVE_DIR" ! -name "$STATE_DIR_NAME" ! -name "$UNKNOWN_DIR_NAME" ! -name "$NOT_AUDIO_DIR_NAME" ! -name "$LOSSY_ARCHIVE_DIR_NAME" ! -name "$MUSICLIB_LEGACY_LOSSY_ARCHIVE_DIR_NAME" | LC_ALL=C sort)}")
+  release_dirs=("${(@f)$(ml_find_non_reserved_child_dirs "$artist_root")}")
   for dir in "${release_dirs[@]}"; do
     [[ -n "$dir" ]] || continue
     kind="$(ml_dir_kind "$dir")"
@@ -285,8 +285,8 @@ sort_artist_root() {
         sort_release_dir "$dir" "$artist_root"
         ;;
       artist)
-        ml_warn "moving nested artist directory to $UNKNOWN_DIR_NAME: $(ml_display_path "$dir")"
-        sort_move_to_unknown "$dir" "$artist_root" "nested artist directory"
+        ml_log_step "recurse" "nested artist directory $(ml_display_path "$dir")"
+        sort_artist_root "$dir"
         ;;
       *)
         if ! ml_dir_has_non_special_content "$dir"; then
