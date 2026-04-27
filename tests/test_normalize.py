@@ -1,7 +1,7 @@
 import unittest
 
 from musicpipeline.models import ProbeResult
-from musicpipeline.normalize import codec_quality_tag, normalize_metadata, sanitize_path_component
+from musicpipeline.normalize import album_quality_suffix, apply_album_group_consensus, apply_consensus_album_artist, codec_quality_tag, normalize_metadata, sanitize_path_component
 
 
 class NormalizeTests(unittest.TestCase):
@@ -64,6 +64,61 @@ class NormalizeTests(unittest.TestCase):
             "16-44",
         )
         self.assertEqual(codec_quality_tag(ProbeResult(status="audio", codec="aac", audio_kind="lossy")), "aac")
+
+    def test_apply_consensus_album_artist_fills_missing_album_artist(self):
+        first = normalize_metadata(
+            {
+                "artist": "Teddy Swims",
+                "album_artist": "Teddy Swims",
+                "album": "Album",
+                "title": "Song A",
+                "year": "2025",
+                "track": "1",
+            }
+        )
+        second = normalize_metadata(
+            {
+                "artist": "Guest/Teddy Swims",
+                "album_artist": "",
+                "album": "Album",
+                "title": "Song B",
+                "year": "2025",
+                "track": "2",
+            }
+        )
+
+        harmonized = apply_consensus_album_artist([first, second])
+
+        self.assertEqual(harmonized[1].album_artist, "Teddy Swims")
+        self.assertEqual(harmonized[1].routing_artist, "Teddy Swims")
+        self.assertNotIn("album_artist", harmonized[1].missing_important_tags)
+
+    def test_apply_album_group_consensus_overrides_outlier_routing_artist(self):
+        dominant = normalize_metadata(
+            {
+                "artist": "Teddy Swims",
+                "album_artist": "Teddy Swims",
+                "album": "Album",
+                "title": "Song A",
+                "year": "2025",
+                "track": "1",
+            }
+        )
+        outlier = normalize_metadata(
+            {
+                "artist": "Teddy Swims/Muni Long",
+                "album_artist": "Teddy Swims/Muni Long",
+                "album": "Album",
+                "title": "Song B",
+                "year": "2025",
+                "track": "2",
+            }
+        )
+        harmonized = apply_album_group_consensus([dominant, dominant, outlier])
+        self.assertEqual(harmonized[2].routing_artist, "Teddy Swims")
+
+    def test_album_quality_suffix_combines_multiple_qualities(self):
+        self.assertEqual(album_quality_suffix(["24-44", "24-48", "24-44"]), "[24-48][24-44]")
 
 
 if __name__ == "__main__":

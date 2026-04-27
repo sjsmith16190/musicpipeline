@@ -151,17 +151,23 @@ Imports audio plus common related sidecars into the working root while preservin
 
 Behavior:
 
+- requires an explicit source directory
 - default mode is copy
 - `--move` moves instead of copying
+- `--bucket-by-format` flattens imported files into destination buckets such as `./_flac`, `./_alac`, and `./_mp3`
+- rejects source/root overlaps such as scraping the library into itself
+- skips managed and internal directories such as `.musicpipeline`, `_NoMetadata`, `_NotAudio`, `_Lossy`, `_Quarantine`, `_Conflicts`, and `_originalSource`
 - empty-dir cleanup runs only after move mode
-- the legacy shell wrapper still accepts `--output DIR`, which is translated to `--root DIR`
+- `--destination DIR` is the preferred destination flag
+- `--root DIR` and the legacy shell `--output DIR` are accepted as backward-compatible aliases
 
 Examples:
 
 ```zsh
 python3 -m musicpipeline audio-scrape "/path/to/source"
 python3 -m musicpipeline audio-scrape "/path/to/source" --move
-python3 -m musicpipeline audio-scrape "/path/to/source" --root "/path/to/library"
+python3 -m musicpipeline audio-scrape "/path/to/source" --destination "/path/to/library"
+python3 -m musicpipeline audio-scrape "/path/to/source" --destination "/path/to/library" --bucket-by-format
 zsh ./musicpipeline.zsh audio-scrape --output "/path/to/library" "/path/to/source"
 ```
 
@@ -240,12 +246,13 @@ zsh ./musicpipeline.zsh retag-apply "/path/to/library"
 
 ### `delete-source`
 
-Deletes `_originalSource` trees.
+Deletes `_originalSource` trees and the `_NotAudio` directory when present.
 
 Behavior:
 
-- default mode prompts per `_originalSource` tree
-- `--yes` deletes all discovered trees without prompting
+- default mode prints a recursive audit listing for each target before prompting
+- default mode prompts per discovered `_originalSource` tree and for `./_NotAudio`
+- `--yes` deletes all discovered targets without prompting
 
 Examples:
 

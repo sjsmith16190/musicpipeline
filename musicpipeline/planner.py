@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .constants import CONFLICTS_DIR_NAME, LOSSY_DIR_NAME, NO_METADATA_DIR_NAME, NOT_AUDIO_DIR_NAME, QUARANTINE_DIR_NAME, SIDECAR_EXTENSIONS
 from .models import AudioCandidate, NormalizedMetadata, Plan, PlannedOperation, ProbeResult, ScannedFile
-from .normalize import build_track_token, codec_quality_tag, normalize_metadata, sanitize_path_component
+from .normalize import album_quality_suffix, apply_album_group_consensus, build_track_token, codec_quality_tag, normalize_metadata, sanitize_path_component
 
 
 def build_sort_plan(root: Path, scanned_files: list[ScannedFile]) -> Plan:
@@ -63,6 +63,16 @@ def build_sort_plan(root: Path, scanned_files: list[ScannedFile]) -> Plan:
             plan.bump("lossy_audio_files")
         else:
             plan.bump("lossless_audio_files")
+
+    dir_audio_candidates = _harmonize_directory_album_artists(dir_audio_candidates)
+    routable = []
+    unresolved = []
+    for candidates in dir_audio_candidates.values():
+        for candidate in candidates:
+            if candidate.profile == "unresolved":
+                unresolved.append(candidate)
+            else:
+                routable.append(candidate)
 
     album_groups = _group_album_candidates([candidate for candidate in routable if candidate.profile == "album"])
     ambiguous_album_sources = {
@@ -260,7 +270,7 @@ def _routable_audio_operations(
             group_key = _album_group_key(candidate)
             album_info = album_groups[group_key]
             multi_disc = bool(album_info["multi_disc"])
-            destination = root / _album_relative_path(candidate, multi_disc)
+            destination = root / _album_relative_path(candidate, multi_disc, str(album_info["quality_suffix"]))
         operations.append(
             PlannedOperation(
                 op="move",
@@ -273,7 +283,7 @@ def _routable_audio_operations(
     return operations
 
 
-def _album_relative_path(candidate: AudioCandidate, multi_disc: bool) -> Path:
+def _album_relative_path(candidate: AudioCandidate, multi_disc: bool, quality_suffix: str) -> Path:
     metadata = candidate.metadata
     artist_label = metadata.routing_artist or "Unknown Artist"
     track_artist = metadata.artist or artist_label
@@ -282,12 +292,12 @@ def _album_relative_path(candidate: AudioCandidate, multi_disc: bool) -> Path:
     if candidate.library_root == "lossy":
         root_parts.append(LOSSY_DIR_NAME)
     if metadata.is_various_artists:
-        album_dir = f"{year_prefix}VA - {metadata.album} [{candidate.quality_tag}]"
+        album_dir = f"{year_prefix}VA - {metadata.album} {quality_suffix}"
         file_name = f"{build_track_token(metadata.track_number or 0, metadata.disc_number, multi_disc)} {track_artist} - {metadata.title} [{candidate.quality_tag}]{candidate.scanned_file.suffix}"
         root_parts.append(album_dir)
         root_parts.append(file_name)
         return Path(*root_parts)
-    album_dir = f"{year_prefix}{metadata.album} [{candidate.quality_tag}]"
+    album_dir = f"{year_prefix}{metadata.album} {quality_suffix}"
     file_name = f"{build_track_token(metadata.track_number or 0, metadata.disc_number, multi_disc)} {metadata.title} [{candidate.quality_tag}]{candidate.scanned_file.suffix}"
     root_parts.extend([artist_label, album_dir, file_name])
     return Path(*root_parts)
@@ -315,6 +325,7 @@ def _group_album_candidates(candidates: list[AudioCandidate]) -> dict[tuple[str,
             "multi_disc": multi_disc,
             "disc_ambiguous": multi_disc and any(candidate.metadata.disc_number is None for candidate in grouped),
             "sources": [candidate.scanned_file.path for candidate in grouped],
+            "quality_suffix": album_quality_suffix([candidate.quality_tag for candidate in grouped]),
         }
     return output
 
@@ -336,6 +347,28 @@ def _build_audio_candidate(scanned: ScannedFile, probe: ProbeResult) -> AudioCan
     )
 
 
+def _harmonize_directory_album_artists(
+    dir_audio_candidates: dict[Path, list[AudioCandidate]],
+) -> dict[Path, list[AudioCandidate]]:
+    output: dict[Path, list[AudioCandidate]] = {}
+    for relative_dir, candidates in dir_audio_candidates.items():
+        grouped: dict[tuple[str, str, str, str], list[AudioCandidate]] = defaultdict(list)
+        passthrough: list[AudioCandidate] = []
+        for candidate in candidates:
+            metadata = candidate.metadata
+            if candidate.profile != "album" or metadata.album is None:
+                passthrough.append(candidate)
+                continue
+            grouped[(metadata.album, metadata.year or "", candidate.library_root)].append(candidate)
+        harmonized = list(passthrough)
+        for group_candidates in grouped.values():
+            merged_metadata = apply_album_group_consensus([candidate.metadata for candidate in group_candidates])
+            for candidate, metadata in zip(group_candidates, merged_metadata, strict=True):
+                harmonized.append(replace(candidate, metadata=metadata))
+        output[relative_dir] = harmonized
+    return output
+
+
 def _profile_for_metadata(metadata: NormalizedMetadata) -> str:
     if metadata.album and metadata.title and (metadata.album_artist or metadata.artist):
         return "album"
@@ -352,7 +385,6 @@ def _album_group_key(candidate: AudioCandidate) -> tuple[str, ...]:
         metadata.routing_artist or "",
         metadata.album or "",
         metadata.year or "",
-        candidate.quality_tag,
     )
 
 
@@ -440,7 +472,9 @@ def _sidecar_album_destinations(
             continue
         group_key = _album_group_key(candidate)
         multi_disc = bool(album_groups[group_key]["multi_disc"])
-        destinations[candidate.scanned_file.relative_path.parent].add((root / _album_relative_path(candidate, multi_disc)).parent)
+        destinations[candidate.scanned_file.relative_path.parent].add(
+            (root / _album_relative_path(candidate, multi_disc, str(album_groups[group_key]["quality_suffix"]))).parent
+        )
     resolved: dict[Path, Path] = {}
     for parent, targets in destinations.items():
         if len(targets) == 1:

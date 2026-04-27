@@ -119,6 +119,112 @@ class PlannerTests(unittest.TestCase):
                 )
             )
 
+    def test_album_group_uses_consensus_album_artist_for_featured_tracks(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory).resolve()
+            scanned = [
+                _scanned(
+                    tmp_path,
+                    "drop/01 - Not Your Man.flac",
+                    _audio_probe(
+                        codec="flac",
+                        kind="lossless",
+                        artist="Teddy Swims",
+                        album_artist="Teddy Swims",
+                        album="I've Tried Everything But Therapy (Part 2)",
+                        title="Not Your Man",
+                        date="2025",
+                        track="1/13",
+                        genre="Pop",
+                    ),
+                ),
+                _scanned(
+                    tmp_path,
+                    "drop/11 - She Got It.flac",
+                    _audio_probe(
+                        codec="flac",
+                        kind="lossless",
+                        artist="Coco Jones/Teddy Swims/Glorilla",
+                        album_artist="",
+                        album="I've Tried Everything But Therapy (Part 2)",
+                        title="She Got It",
+                        date="2025",
+                        track="11/13",
+                        genre="Pop",
+                    ),
+                ),
+            ]
+            plan = build_sort_plan(tmp_path, scanned)
+            destinations = {
+                operation.destination.relative_to(tmp_path)
+                for operation in plan.operations
+                if operation.op == "move"
+            }
+            self.assertIn(
+                Path("Teddy Swims/[2025] I've Tried Everything But Therapy (Part 2) [16-44]/[1] Not Your Man [16-44].flac"),
+                destinations,
+            )
+            self.assertIn(
+                Path("Teddy Swims/[2025] I've Tried Everything But Therapy (Part 2) [16-44]/[11] She Got It [16-44].flac"),
+                destinations,
+            )
+
+    def test_album_group_combines_mixed_quality_tags_into_one_album_folder(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory).resolve()
+            scanned = [
+                _scanned(
+                    tmp_path,
+                    "drop/track1.flac",
+                    _audio_probe(
+                        codec="flac",
+                        kind="lossless",
+                        artist="Artist",
+                        album_artist="Artist",
+                        album="Album",
+                        title="Track One",
+                        date="2025",
+                        track="1/2",
+                        bits_per_sample=24,
+                        sample_rate=48000,
+                    ),
+                ),
+                _scanned(
+                    tmp_path,
+                    "drop/track2.flac",
+                    _audio_probe(
+                        codec="flac",
+                        kind="lossless",
+                        artist="Artist",
+                        album_artist="Artist",
+                        album="Album",
+                        title="Track Two",
+                        date="2025",
+                        track="2/2",
+                        bits_per_sample=24,
+                        sample_rate=44100,
+                    ),
+                ),
+            ]
+            plan = build_sort_plan(tmp_path, scanned)
+            destinations = {
+                operation.destination.relative_to(tmp_path)
+                for operation in plan.operations
+                if operation.op == "move"
+            }
+            self.assertIn(
+                Path("Artist/[2025] Album [24-48][24-44]/[1] Track One [24-48].flac"),
+                destinations,
+            )
+            self.assertIn(
+                Path("Artist/[2025] Album [24-48][24-44]/[2] Track Two [24-44].flac"),
+                destinations,
+            )
+
     def test_attached_release_sidecar_moves_with_routable_album(self):
         import tempfile
 
@@ -381,6 +487,33 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual(tracks[0]["title"], "Track One")
             self.assertEqual(tracks[0]["performer"], "Track Artist")
             self.assertEqual(tracks[1]["track_number"], 2)
+            self.assertEqual(tracks[0]["source_file"], "image.flac")
+
+    def test_parse_cue_file_tracks_multiple_source_files(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            cue_path = Path(directory) / "album.cue"
+            cue_path.write_text(
+                '\n'.join(
+                    [
+                        'PERFORMER "Artist"',
+                        'TITLE "Album"',
+                        'FILE "disc-a.flac" WAVE',
+                        '  TRACK 01 AUDIO',
+                        '    TITLE "Track A1"',
+                        '    INDEX 01 00:00:00',
+                        'FILE "disc-b.flac" WAVE',
+                        '  TRACK 02 AUDIO',
+                        '    TITLE "Track B1"',
+                        '    INDEX 01 00:00:00',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            _, tracks = _parse_cue_file(cue_path)
+            self.assertEqual(tracks[0]["source_file"], "disc-a.flac")
+            self.assertEqual(tracks[1]["source_file"], "disc-b.flac")
 
 
 if __name__ == "__main__":

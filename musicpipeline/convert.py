@@ -4,12 +4,15 @@ import re
 import shutil
 import subprocess
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 
 from .constants import ARTWORK_PRIORITY, ORIGINAL_SOURCE_DIR_NAME, QUARANTINE_DIR_NAME, SIDECAR_EXTENSIONS, STATE_DIR_NAME
 from .models import PlannedOperation, ScannedFile
-from .normalize import build_track_token, codec_quality_tag, normalize_metadata
+from .normalize import album_quality_suffix, apply_album_group_consensus, build_track_token, codec_quality_tag, normalize_metadata
 from .probe import ProbeResult, validate_alac_output, validate_audio_decode
+
+_DISC_DIR_RE = re.compile(r"^(disc|cd)\s*0*\d+$", re.IGNORECASE)
 
 
 def convert_units(root: Path, scanned_files: list[ScannedFile], logger, dry_run: bool) -> dict[str, int]:
@@ -20,10 +23,11 @@ def convert_units(root: Path, scanned_files: list[ScannedFile], logger, dry_run:
     for scanned in scanned_files:
         if scanned.probe.status != "audio" or scanned.probe.audio_kind != "lossless":
             continue
-        if scanned.path.parent == root:
+        unit_root = _convert_unit_root(root, scanned.path)
+        if unit_root == root:
             loose_units.append(scanned)
         else:
-            release_units[scanned.path.parent].append(scanned)
+            release_units[unit_root].append(scanned)
 
     for directory in sorted(release_units):
         _convert_release_unit(root, directory, release_units[directory], logger, dry_run, summary)
@@ -34,15 +38,13 @@ def convert_units(root: Path, scanned_files: list[ScannedFile], logger, dry_run:
 
 def _convert_release_unit(root: Path, directory: Path, files: list[ScannedFile], logger, dry_run: bool, summary: dict[str, int]) -> None:
     cue_path = _cue_file_in_dir(directory)
-    if cue_path is not None and len(files) == 1:
-        if _convert_cue_release_unit(root, directory, cue_path, files[0], logger, dry_run, summary):
+    if cue_path is not None:
+        if _convert_cue_release_unit(root, directory, cue_path, files, logger, dry_run, summary):
             return
-        return
 
-    release_metadata = [normalize_metadata(scanned.probe.metadata) for scanned in files]
+    release_metadata = _release_metadata_for_unit(directory, files)
     if not release_metadata or any(metadata.album is None or metadata.title is None or (metadata.album_artist is None and metadata.artist is None) for metadata in release_metadata):
-        logger.log(f"[convert-skip] ./{directory.relative_to(root)} (insufficient metadata for release conversion)")
-        summary["convert_skipped"] += 1
+        _convert_unresolved_release_unit(root, directory, files, logger, dry_run, summary, reason="insufficient metadata for release conversion")
         return
     first = release_metadata[0]
     if any(
@@ -52,13 +54,12 @@ def _convert_release_unit(root: Path, directory: Path, files: list[ScannedFile],
         or metadata.is_various_artists != first.is_various_artists
         for metadata in release_metadata
     ):
-        logger.log(f"[convert-skip] ./{directory.relative_to(root)} (mixed release metadata)")
-        summary["convert_skipped"] += 1
+        _convert_unresolved_release_unit(root, directory, files, logger, dry_run, summary, reason="mixed release metadata")
         return
     discs = {metadata.disc_number or 1 for metadata in release_metadata}
     multi_disc = len(discs) > 1 or any(value > 1 for value in discs)
-    quality_tag = codec_quality_tag(files[0].probe)
-    release_destination = _release_destination_root(first, quality_tag)
+    quality_suffix = album_quality_suffix([codec_quality_tag(scanned.probe) for scanned in files])
+    release_destination = _release_destination_root(first, quality_suffix)
     target_dir = root / release_destination
     archive_dir = root / (first.routing_artist or "Unknown Artist") / ORIGINAL_SOURCE_DIR_NAME / _archive_release_dir_name(first)
     artwork = _select_artwork(directory)
@@ -73,6 +74,8 @@ def _convert_release_unit(root: Path, directory: Path, files: list[ScannedFile],
         return
 
     converted_outputs: list[tuple[Path, Path]] = []
+    disc_total = len({metadata.disc_number for metadata in release_metadata if metadata.disc_number is not None}) or 1
+    track_totals_by_disc = _track_totals_by_disc(release_metadata)
     try:
         for scanned, metadata in sorted(zip(files, release_metadata, strict=True), key=lambda pair: str(pair[0].relative_path)):
             if metadata.track_number is None:
@@ -91,7 +94,16 @@ def _convert_release_unit(root: Path, directory: Path, files: list[ScannedFile],
                 logger.log(f"[convert-fail] ./{scanned.relative_path} (existing output invalid: {reason})")
                 _quarantine_file(root, scanned.path, "convert", reason or "existing output invalid", logger, dry_run, summary)
                 return
-            success, reason = _run_ffmpeg_convert(scanned.path, temp_output, artwork)
+            success, reason = _run_ffmpeg_convert(
+                scanned.path,
+                temp_output,
+                artwork,
+                metadata_overrides=_release_metadata_overrides(
+                    metadata,
+                    disc_total=disc_total,
+                    track_total=track_totals_by_disc.get(metadata.disc_number or 1),
+                ),
+            )
             if not success:
                 _quarantine_file(root, scanned.path, "convert", reason or "conversion failed", logger, dry_run, summary)
                 return
@@ -165,7 +177,76 @@ def _convert_single_file(root: Path, scanned: ScannedFile, logger, dry_run: bool
     summary["preserved_source_units"] += 1
 
 
-def _run_ffmpeg_convert(source: Path, destination: Path, artwork: Path | None) -> tuple[bool, str | None]:
+def _convert_unresolved_release_unit(
+    root: Path,
+    directory: Path,
+    files: list[ScannedFile],
+    logger,
+    dry_run: bool,
+    summary: dict[str, int],
+    *,
+    reason: str,
+) -> None:
+    logger.log(f"[convert-unresolved] ./{directory.relative_to(root)} ({reason})")
+    artwork = _select_artwork(directory)
+    archive_dir = directory / ORIGINAL_SOURCE_DIR_NAME
+    temp_dir = root / STATE_DIR_NAME / "tmp" / directory.relative_to(root)
+    if archive_dir.exists():
+        logger.log(f"[convert-skip] ./{directory.relative_to(root)} (source archive already exists at ./{archive_dir.relative_to(root)})")
+        summary["convert_skipped"] += 1
+        return
+    if not dry_run:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+    converted_outputs: list[tuple[Path, Path]] = []
+    try:
+        for scanned in sorted(files, key=lambda item: str(item.relative_path)):
+            temp_output = temp_dir / f"{scanned.path.stem}.tmp.m4a"
+            final_output = scanned.path.with_suffix(".m4a")
+            if final_output.exists():
+                valid, existing_reason = validate_alac_output(final_output)
+                if valid:
+                    logger.log(f"[convert-skip] ./{scanned.relative_path} -> ./{final_output.relative_to(root)} (valid ALAC already exists)")
+                    summary["convert_skipped"] += 1
+                    continue
+                _quarantine_file(root, scanned.path, "convert", existing_reason or "existing output invalid", logger, dry_run, summary)
+                return
+            success, convert_reason = _run_ffmpeg_convert(scanned.path, temp_output, artwork)
+            if not success:
+                _quarantine_file(root, scanned.path, "convert", convert_reason or "conversion failed", logger, dry_run, summary)
+                return
+            valid, validate_reason = validate_alac_output(temp_output)
+            if not valid:
+                _quarantine_file(root, scanned.path, "convert", validate_reason or "converted output failed validation", logger, dry_run, summary)
+                if not dry_run and temp_output.exists():
+                    temp_output.unlink()
+                return
+            converted_outputs.append((temp_output, final_output))
+
+        logger.log(f"[preserve-source] ./{directory.relative_to(root)} -> ./{archive_dir.relative_to(root)}")
+        if not dry_run:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            for scanned in sorted(files, key=lambda item: str(item.relative_path)):
+                archived = archive_dir / scanned.path.relative_to(directory)
+                archived.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(scanned.path), str(archived))
+        for temp_output, final_output in converted_outputs:
+            logger.log(f"[convert] ./{final_output.with_suffix('.flac').relative_to(root)} -> ./{final_output.relative_to(root)}")
+            if not dry_run:
+                final_output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(temp_output), str(final_output))
+            summary["converted_files"] += 1
+        summary["preserved_source_units"] += 1
+    finally:
+        if not dry_run and temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _run_ffmpeg_convert(
+    source: Path,
+    destination: Path,
+    artwork: Path | None,
+    metadata_overrides: dict[str, str] | None = None,
+) -> tuple[bool, str | None]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     command = [
         "ffmpeg",
@@ -179,11 +260,13 @@ def _run_ffmpeg_convert(source: Path, destination: Path, artwork: Path | None) -
     if artwork:
         command.extend(["-i", str(artwork)])
     command.extend(["-map", "0:a:0", "-map_metadata", "0"])
+    for key, value in (metadata_overrides or {}).items():
+        command.extend(["-metadata", f"{key}={value}"])
     if artwork:
         command.extend(["-map", "1:v:0", "-disposition:v:0", "attached_pic"])
     else:
         command.extend(["-map", "0:v?", "-disposition:v:0", "attached_pic"])
-    command.extend(["-c:a", "alac", str(destination)])
+    command.extend(["-c:a", "alac", "-c:v", "mjpeg", str(destination)])
     completed = subprocess.run(command, check=False, capture_output=True, text=True)
     if completed.returncode == 0:
         return True, None
@@ -220,18 +303,18 @@ def _run_ffmpeg_segment_convert(
         command.extend(["-map", "1:v:0", "-disposition:v:0", "attached_pic"])
     else:
         command.extend(["-map", "0:v?", "-disposition:v:0", "attached_pic"])
-    command.extend(["-c:a", "alac", str(destination)])
+    command.extend(["-c:a", "alac", "-c:v", "mjpeg", str(destination)])
     completed = subprocess.run(command, check=False, capture_output=True, text=True)
     if completed.returncode == 0:
         return True, None
     return False, (completed.stderr or "ffmpeg segment conversion failed").strip()
 
 
-def _release_destination_root(metadata, quality_tag: str) -> Path:
+def _release_destination_root(metadata, quality_suffix: str) -> Path:
     year_prefix = f"[{metadata.year}] " if metadata.year else ""
     if metadata.is_various_artists:
-        return Path(f"{year_prefix}VA - {metadata.album} [{quality_tag}]")
-    return Path(metadata.routing_artist or "Unknown Artist", f"{year_prefix}{metadata.album} [{quality_tag}]")
+        return Path(f"{year_prefix}VA - {metadata.album} {quality_suffix}")
+    return Path(metadata.routing_artist or "Unknown Artist", f"{year_prefix}{metadata.album} {quality_suffix}")
 
 
 def _archive_release_dir_name(metadata) -> str:
@@ -280,7 +363,7 @@ def _convert_cue_release_unit(
     root: Path,
     directory: Path,
     cue_path: Path,
-    source_file: ScannedFile,
+    files: list[ScannedFile],
     logger,
     dry_run: bool,
     summary: dict[str, int],
@@ -290,11 +373,12 @@ def _convert_cue_release_unit(
         logger.log(f"[cue-fail] ./{cue_path.relative_to(root)} (no track entries found)")
         summary["cue_split_failures"] += 1
         return True
-    fallback_tags = source_file.probe.metadata
-    normalized_tracks = [
+    source_files = {scanned.path.name.casefold(): scanned for scanned in files}
+    fallback_tags = files[0].probe.metadata if files else {}
+    normalized_tracks = apply_album_group_consensus([
         normalize_metadata(
             {
-                "artist": track.get("artist") or fallback_tags.get("artist", ""),
+                "artist": track.get("artist") or source_files.get(str(track.get("source_file") or "").casefold(), files[0]).probe.metadata.get("artist", "") if files else fallback_tags.get("artist", ""),
                 "album_artist": album_meta.get("album_artist") or fallback_tags.get("album_artist", ""),
                 "albumartist": album_meta.get("album_artist") or fallback_tags.get("albumartist", ""),
                 "album": album_meta.get("album") or fallback_tags.get("album", ""),
@@ -307,16 +391,19 @@ def _convert_cue_release_unit(
             }
         )
         for track in track_entries
-    ]
-    if any(metadata.album is None or metadata.title is None or (metadata.album_artist is None and metadata.artist is None) for metadata in normalized_tracks):
-        logger.log(f"[cue-fail] ./{cue_path.relative_to(root)} (insufficient cue metadata for routing)")
+    ])
+    routable = not any(metadata.album is None or metadata.title is None or (metadata.album_artist is None and metadata.artist is None) for metadata in normalized_tracks)
+    first_source = source_files.get(str(track_entries[0].get("source_file") or "").casefold()) if track_entries else None
+    if first_source is None and files:
+        first_source = files[0]
+    if first_source is None:
+        logger.log(f"[cue-fail] ./{cue_path.relative_to(root)} (no source audio matched cue entries)")
         summary["cue_split_failures"] += 1
         return True
-
     first = normalized_tracks[0]
-    quality_tag = codec_quality_tag(source_file.probe)
-    target_dir = root / _release_destination_root(first, quality_tag)
-    archive_dir = root / (first.routing_artist or "Unknown Artist") / ORIGINAL_SOURCE_DIR_NAME / _archive_release_dir_name(first)
+    quality_suffix = album_quality_suffix([codec_quality_tag(source.probe) for source in files])
+    target_dir = root / _release_destination_root(first, quality_suffix) if routable else directory
+    archive_dir = (root / (first.routing_artist or "Unknown Artist") / ORIGINAL_SOURCE_DIR_NAME / _archive_release_dir_name(first)) if routable else (directory / ORIGINAL_SOURCE_DIR_NAME)
     artwork = _select_artwork(directory)
     temp_dir = root / STATE_DIR_NAME / "tmp" / directory.relative_to(root)
     if archive_dir.exists():
@@ -329,11 +416,23 @@ def _convert_cue_release_unit(
     try:
         total_tracks = len(track_entries)
         for index, (track, metadata) in enumerate(zip(track_entries, normalized_tracks, strict=True)):
+            source_file = source_files.get(str(track.get("source_file") or "").casefold())
+            if source_file is None:
+                logger.log(f"[cue-fail] ./{cue_path.relative_to(root)} (missing source file {track.get('source_file')})")
+                summary["cue_split_failures"] += 1
+                return True
             start = float(track["index_seconds"])
             duration = None
-            if index + 1 < total_tracks:
+            if index + 1 < total_tracks and track_entries[index + 1].get("source_file") == track.get("source_file"):
                 duration = float(track_entries[index + 1]["index_seconds"]) - start
-            output_name = _release_output_name(metadata, source_file.probe, source_file.path.suffix, False)
+            inferred_disc = _disc_number_from_path(directory, source_file.path) or metadata.disc_number
+            effective_metadata = replace(metadata, disc_number=inferred_disc)
+            output_name = _release_output_name(
+                effective_metadata,
+                source_file.probe,
+                source_file.path.suffix,
+                inferred_disc is not None and inferred_disc > 1 or len({(_disc_number_from_path(directory, source.path) or 1) for source in files}) > 1,
+            ) if routable else _cue_unresolved_output_name(track, metadata)
             temp_output = temp_dir / f"{Path(output_name).stem}.tmp.m4a"
             final_output = target_dir / output_name
             if final_output.exists():
@@ -377,8 +476,11 @@ def _convert_cue_release_unit(
 
         logger.log(f"[preserve-source] ./{directory.relative_to(root)} -> ./{archive_dir.relative_to(root)}")
         if not dry_run:
-            archive_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(directory), str(archive_dir))
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            for source_file in sorted(files, key=lambda item: str(item.relative_path)):
+                archived = archive_dir / source_file.path.relative_to(directory)
+                archived.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source_file.path), str(archived))
         for temp_output, final_output in converted_outputs:
             logger.log(f"[convert] ./{cue_path.relative_to(root)} -> ./{final_output.relative_to(root)}")
             if not dry_run:
@@ -398,9 +500,14 @@ def _parse_cue_file(cue_path: Path) -> tuple[dict[str, str], list[dict[str, obje
     album_date = ""
     tracks: list[dict[str, object]] = []
     current_track: dict[str, object] | None = None
+    current_file = ""
     for raw_line in cue_path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = raw_line.strip()
         if not line:
+            continue
+        file_match = re.match(r'^FILE\s+"(.+)"\s+\S+$', line, re.IGNORECASE)
+        if file_match:
+            current_file = file_match.group(1)
             continue
         if line.upper().startswith("REM DATE "):
             album_date = _cue_unquote(line[9:])
@@ -416,7 +523,7 @@ def _parse_cue_file(cue_path: Path) -> tuple[dict[str, str], list[dict[str, obje
             continue
         track_match = re.match(r"^TRACK\s+(\d+)\s+AUDIO$", line, re.IGNORECASE)
         if track_match:
-            current_track = {"track_number": int(track_match.group(1))}
+            current_track = {"track_number": int(track_match.group(1)), "source_file": current_file}
             tracks.append(current_track)
             continue
         if current_track is None:
@@ -448,3 +555,71 @@ def _cue_time_to_seconds(value: str) -> float:
 
 def _format_seconds(value: float) -> str:
     return f"{value:.3f}"
+
+
+def _cue_unresolved_output_name(track: dict[str, object], metadata) -> str:
+    track_number = str(track.get("track_number") or metadata.track_number or "0")
+    title = metadata.title or f"Track {track_number}"
+    return f"[{track_number}] {title}.m4a"
+
+
+def _convert_unit_root(root: Path, path: Path) -> Path:
+    parent = path.parent
+    if parent == root:
+        return root
+    if _DISC_DIR_RE.match(parent.name) and parent.parent != root:
+        return parent.parent
+    return parent
+
+
+def _release_metadata_for_unit(directory: Path, files: list[ScannedFile]):
+    metadata_list = []
+    for scanned in files:
+        metadata = normalize_metadata(scanned.probe.metadata)
+        inferred_disc = _disc_number_from_path(directory, scanned.path)
+        if inferred_disc is not None and metadata.disc_number is None:
+            metadata = replace(metadata, disc_number=inferred_disc)
+        metadata_list.append(metadata)
+    return apply_album_group_consensus(metadata_list)
+
+
+def _disc_number_from_path(directory: Path, path: Path) -> int | None:
+    try:
+        relative = path.relative_to(directory)
+    except ValueError:
+        return None
+    if not relative.parts:
+        return None
+    first_part = relative.parts[0]
+    if not _DISC_DIR_RE.match(first_part):
+        return None
+    digits = "".join(character for character in first_part if character.isdigit())
+    return int(digits, 10) if digits else None
+
+
+def _track_totals_by_disc(metadata_list) -> dict[int, int]:
+    totals: dict[int, int] = defaultdict(int)
+    for metadata in metadata_list:
+        totals[metadata.disc_number or 1] += 1
+    return dict(totals)
+
+
+def _release_metadata_overrides(metadata, *, disc_total: int, track_total: int | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    if metadata.artist:
+        overrides["artist"] = metadata.artist
+    if metadata.album_artist:
+        overrides["album_artist"] = metadata.album_artist
+    if metadata.album:
+        overrides["album"] = metadata.album
+    if metadata.title:
+        overrides["title"] = metadata.title
+    if metadata.year:
+        overrides["date"] = metadata.year
+    if metadata.genre:
+        overrides["genre"] = metadata.genre
+    if metadata.track_number is not None:
+        overrides["track"] = f"{metadata.track_number}/{track_total}" if track_total else str(metadata.track_number)
+    if metadata.disc_number is not None:
+        overrides["disc"] = f"{metadata.disc_number}/{disc_total}" if disc_total > 1 else str(metadata.disc_number)
+    return overrides

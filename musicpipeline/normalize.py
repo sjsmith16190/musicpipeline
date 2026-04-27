@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 from .constants import IMPORTANT_TAGS, KNOWN_AUDIO_EXTENSIONS, LOSSY_QUALITY_LABELS, PLACEHOLDER_VALUES, VA_NAMES
@@ -15,6 +17,7 @@ _TRACKISH_RE = re.compile(r"^track\s*0*[0-9]+$", re.IGNORECASE)
 _BRACKET_INDEX_PREFIX_RE = re.compile(r"^\[\d+\]\s+")
 _DECIMAL_INDEX_PREFIX_RE = re.compile(r"^\d+[.)]\s+")
 _DASHED_INDEX_PREFIX_RE = re.compile(r"^\d{1,2}[-_]\s*")
+_NUMERIC_QUALITY_RE = re.compile(r"^(\d+)-(\d+)$")
 
 
 def _strip_legacy_prefixes(value: str) -> str:
@@ -196,6 +199,56 @@ def normalize_metadata(raw: dict[str, str]) -> NormalizedMetadata:
         routing_artist=routing_artist,
         missing_important_tags=tuple(missing),
     )
+
+
+def apply_consensus_album_artist(items: list[NormalizedMetadata]) -> list[NormalizedMetadata]:
+    consensus_values = sorted({item.album_artist for item in items if item.album_artist})
+    if len(consensus_values) != 1:
+        return items
+    consensus = consensus_values[0]
+    output: list[NormalizedMetadata] = []
+    for item in items:
+        if item.album_artist:
+            output.append(item)
+            continue
+        output.append(
+            replace(
+                item,
+                album_artist=consensus,
+                routing_artist="VA" if item.is_various_artists else consensus,
+                missing_important_tags=tuple(tag for tag in item.missing_important_tags if tag != "album_artist"),
+            )
+        )
+    return output
+
+
+def apply_album_group_consensus(items: list[NormalizedMetadata]) -> list[NormalizedMetadata]:
+    output = apply_consensus_album_artist(items)
+    routing_counts = Counter(item.routing_artist for item in output if item.routing_artist and not item.is_various_artists)
+    if not routing_counts:
+        return output
+    ranked = routing_counts.most_common(2)
+    top_value, top_count = ranked[0]
+    second_count = ranked[1][1] if len(ranked) > 1 else 0
+    if top_count < 2 or top_count <= second_count:
+        return output
+    return [replace(item, routing_artist="VA" if item.is_various_artists else top_value) for item in output]
+
+
+def album_quality_suffix(quality_tags: list[str]) -> str:
+    values = sorted({tag for tag in quality_tags if tag}, key=_quality_sort_key)
+    if not values:
+        return "[unknown]"
+    return "".join(f"[{tag}]" for tag in values)
+
+
+def _quality_sort_key(tag: str) -> tuple[int, int, int, str]:
+    match = _NUMERIC_QUALITY_RE.match(tag)
+    if match:
+        bits = int(match.group(1))
+        khz = int(match.group(2))
+        return (0, -bits, -khz, tag)
+    return (1, 0, 0, tag)
 
 
 def build_track_token(track_number: int, disc_number: int | None, multi_disc: bool) -> str:

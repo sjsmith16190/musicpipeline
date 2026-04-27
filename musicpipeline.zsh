@@ -74,9 +74,16 @@ _musicpipeline_python() {
     audio-scrape)
       while (( $# )); do
         case "$1" in
-          --root)
+          --destination)
             saw_root_flag=1
             translated+=("$1")
+            shift
+            (( $# )) || { print -ru2 -- "error: --destination requires a directory argument"; return 1; }
+            translated+=("$1")
+            ;;
+          --root)
+            saw_root_flag=1
+            translated+=(--destination)
             shift
             (( $# )) || { print -ru2 -- "error: --root requires a directory argument"; return 1; }
             translated+=("$1")
@@ -90,7 +97,7 @@ _musicpipeline_python() {
             saw_help_flag=1
             translated+=("$1")
             ;;
-          --dry-run|--move)
+          --dry-run|--move|--bucket-by-format)
             translated+=("$1")
             ;;
           --)
@@ -108,13 +115,13 @@ _musicpipeline_python() {
         esac
         shift
       done
-      if [[ -n "$output_root" && ! "$translated[*]" == *"--root"* ]]; then
-        translated+=(--root "$output_root")
+      if [[ -n "$output_root" && ! "$translated[*]" == *"--destination"* ]]; then
+        translated+=(--destination "$output_root")
       elif (( ! saw_root_flag && ! saw_help_flag )); then
-        translated+=(--root "$cwd")
+        translated+=(--destination "$cwd")
       fi
-      if (( ! saw_help_flag )); then
-        translated+=("${audio_scrape_source:-$cwd}")
+      if [[ -n "$audio_scrape_source" ]]; then
+        translated+=("$audio_scrape_source")
       fi
       ;;
     *)
