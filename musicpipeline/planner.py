@@ -7,7 +7,15 @@ from pathlib import Path
 
 from .constants import CONFLICTS_DIR_NAME, LOSSY_DIR_NAME, NO_METADATA_DIR_NAME, NOT_AUDIO_DIR_NAME, QUARANTINE_DIR_NAME, SIDECAR_EXTENSIONS
 from .models import AudioCandidate, NormalizedMetadata, Plan, PlannedOperation, ProbeResult, ScannedFile
-from .normalize import album_quality_suffix, apply_album_group_consensus, build_track_token, codec_quality_tag, normalize_metadata, sanitize_path_component
+from .normalize import (
+    album_quality_suffix,
+    apply_album_group_consensus,
+    build_track_token,
+    codec_quality_tag,
+    normalize_metadata,
+    sanitize_path_component,
+    single_track_filename,
+)
 
 
 def build_sort_plan(root: Path, scanned_files: list[ScannedFile]) -> Plan:
@@ -75,15 +83,17 @@ def build_sort_plan(root: Path, scanned_files: list[ScannedFile]) -> Plan:
                 routable.append(candidate)
 
     album_groups = _group_album_candidates([candidate for candidate in routable if candidate.profile == "album"])
-    ambiguous_album_sources = {
+    routable = _demote_singleton_album_groups(routable, album_groups)
+    album_groups = _group_album_candidates([candidate for candidate in routable if candidate.profile == "album"])
+    unroutable_album_sources = {
         path
-        for key, info in album_groups.items()
-        if bool(info["disc_ambiguous"])
+        for info in album_groups.values()
+        if bool(info["disc_ambiguous"]) or bool(info["track_missing"])
         for path in info["sources"]
     }
     stable_routable: list[AudioCandidate] = []
     for candidate in routable:
-        if candidate.profile == "album" and candidate.scanned_file.path in ambiguous_album_sources:
+        if candidate.profile == "album" and candidate.scanned_file.path in unroutable_album_sources:
             unresolved.append(replace(candidate, profile="unresolved"))
             continue
         stable_routable.append(candidate)
@@ -306,8 +316,14 @@ def _album_relative_path(candidate: AudioCandidate, multi_disc: bool, quality_su
 def _single_relative_path(candidate: AudioCandidate) -> Path:
     metadata = candidate.metadata
     artist_label = metadata.artist or metadata.routing_artist or "Unknown Artist"
-    year_prefix = f"[{metadata.year}] " if metadata.year else ""
-    file_name = f"{year_prefix}{artist_label} - {metadata.title} [{candidate.quality_tag}]{candidate.scanned_file.suffix}"
+    file_name = single_track_filename(
+        artist_label,
+        metadata.title or "Unknown Title",
+        metadata.year,
+        candidate.quality_tag,
+        candidate.scanned_file.suffix,
+        lossy=candidate.library_root == "lossy",
+    )
     if candidate.library_root == "lossy":
         return Path(LOSSY_DIR_NAME, artist_label, file_name)
     return Path(artist_label, file_name)
@@ -324,17 +340,33 @@ def _group_album_candidates(candidates: list[AudioCandidate]) -> dict[tuple[str,
         output[key] = {
             "multi_disc": multi_disc,
             "disc_ambiguous": multi_disc and any(candidate.metadata.disc_number is None for candidate in grouped),
+            "track_missing": any(candidate.metadata.track_number is None for candidate in grouped),
             "sources": [candidate.scanned_file.path for candidate in grouped],
             "quality_suffix": album_quality_suffix([candidate.quality_tag for candidate in grouped]),
         }
     return output
 
 
+def _demote_singleton_album_groups(
+    routable: list[AudioCandidate],
+    album_groups: dict[tuple[str, ...], dict[str, object]],
+) -> list[AudioCandidate]:
+    output: list[AudioCandidate] = []
+    for candidate in routable:
+        if candidate.profile != "album":
+            output.append(candidate)
+            continue
+        group = album_groups.get(_album_group_key(candidate))
+        if group is not None and len(group["sources"]) == 1:
+            output.append(replace(candidate, profile="single"))
+            continue
+        output.append(candidate)
+    return output
+
+
 def _build_audio_candidate(scanned: ScannedFile, probe: ProbeResult) -> AudioCandidate:
     metadata = normalize_metadata(probe.metadata)
     profile = _profile_for_metadata(metadata)
-    if profile == "album" and metadata.track_number is None:
-        profile = "unresolved"
     if profile == "album" and metadata.is_various_artists and metadata.artist is None:
         profile = "unresolved"
     library_root = "lossy" if probe.audio_kind == "lossy" else "main"

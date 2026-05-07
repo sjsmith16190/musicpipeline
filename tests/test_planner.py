@@ -65,7 +65,7 @@ class PlannerTests(unittest.TestCase):
                 scanned = [
                     _scanned(
                         tmp_path,
-                        "inbox/song.flac",
+                        "inbox/song1.flac",
                         _audio_probe(
                             codec="flac",
                             kind="lossless",
@@ -76,7 +76,21 @@ class PlannerTests(unittest.TestCase):
                             track="1/10",
                             genre="Ambient",
                         ),
-                    )
+                    ),
+                    _scanned(
+                        tmp_path,
+                        "inbox/song2.flac",
+                        _audio_probe(
+                            codec="flac",
+                            kind="lossless",
+                            artist="Song Artist",
+                            album_artist="Album Artist",
+                            album="Album Name",
+                            title="Second Song",
+                            track="2/10",
+                            genre="Ambient",
+                        ),
+                    ),
                 ]
                 plan = build_sort_plan(tmp_path, scanned)
                 self.assertTrue(
@@ -88,6 +102,65 @@ class PlannerTests(unittest.TestCase):
                 )
                 self.assertIn("year", plan.missing_manifest)
 
+    def test_album_tagged_single_routes_to_artist_root(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory).resolve()
+            scanned = [
+                _scanned(
+                    tmp_path,
+                    "drop/song.flac",
+                    _audio_probe(
+                        codec="flac",
+                        kind="lossless",
+                        artist="Artist",
+                        album_artist="Artist",
+                        album="One Track Release",
+                        title="Standalone Song",
+                        date="2025",
+                        genre="Pop",
+                    ),
+                )
+            ]
+            plan = build_sort_plan(tmp_path, scanned)
+            destinations = {
+                operation.destination.relative_to(tmp_path)
+                for operation in plan.operations
+                if operation.op == "move"
+            }
+            self.assertIn(Path("Artist/Artist - Standalone Song [2025][16-44].flac"), destinations)
+            self.assertNotIn(Path("Artist/[2025] One Track Release [16-44]/[0] Standalone Song [16-44].flac"), destinations)
+
+    def test_lossy_single_uses_lossy_root_and_uppercase_mp3_quality(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory).resolve()
+            scanned = [
+                _scanned(
+                    tmp_path,
+                    "drop/song.mp3",
+                    _audio_probe(
+                        codec="mp3",
+                        kind="lossy",
+                        artist="Artist",
+                        album_artist="Artist",
+                        album="One Track Release",
+                        title="Standalone Song",
+                        date="2025",
+                        genre="Pop",
+                    ),
+                )
+            ]
+            plan = build_sort_plan(tmp_path, scanned)
+            destinations = {
+                operation.destination.relative_to(tmp_path)
+                for operation in plan.operations
+                if operation.op == "move"
+            }
+            self.assertIn(Path("_Lossy/Artist/Artist - Standalone Song [2025][MP3].mp3"), destinations)
+
     def test_various_artists_album_routes_at_library_root(self):
         import tempfile
 
@@ -96,7 +169,7 @@ class PlannerTests(unittest.TestCase):
             scanned = [
                 _scanned(
                     tmp_path,
-                    "drop/track.flac",
+                    "drop/track1.flac",
                     _audio_probe(
                         codec="flac",
                         kind="lossless",
@@ -108,7 +181,22 @@ class PlannerTests(unittest.TestCase):
                         track="7/20",
                         genre="Electronic",
                     ),
-                )
+                ),
+                _scanned(
+                    tmp_path,
+                    "drop/track2.flac",
+                    _audio_probe(
+                        codec="flac",
+                        kind="lossless",
+                        artist="Second Artist",
+                        album_artist="Various Artists",
+                        album="Compilation",
+                        title="Second Song",
+                        date="2002",
+                        track="8/20",
+                        genre="Electronic",
+                    ),
+                ),
             ]
             plan = build_sort_plan(tmp_path, scanned)
             self.assertTrue(
@@ -233,7 +321,7 @@ class PlannerTests(unittest.TestCase):
             scanned = [
                 _scanned(
                     tmp_path,
-                    "drop/track.flac",
+                    "drop/track1.flac",
                     _audio_probe(
                         codec="flac",
                         kind="lossless",
@@ -243,6 +331,21 @@ class PlannerTests(unittest.TestCase):
                         title="Song Name",
                         date="2002",
                         track="1/10",
+                        genre="Electronic",
+                    ),
+                ),
+                _scanned(
+                    tmp_path,
+                    "drop/track2.flac",
+                    _audio_probe(
+                        codec="flac",
+                        kind="lossless",
+                        artist="Track Artist",
+                        album_artist="Album Artist",
+                        album="Album Name",
+                        title="Second Song",
+                        date="2002",
+                        track="2/10",
                         genre="Electronic",
                     ),
                 ),
@@ -275,7 +378,6 @@ class PlannerTests(unittest.TestCase):
                         kind="lossless",
                         artist="Artist",
                         album="Album",
-                        title="Song",
                         genre="Jazz",
                     ),
                 )
@@ -303,7 +405,6 @@ class PlannerTests(unittest.TestCase):
                         kind="lossless",
                         artist="Artist",
                         album="Album",
-                        title="Song",
                         genre="Jazz",
                     ),
                 ),
@@ -385,7 +486,7 @@ class PlannerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             tmp_path = Path(directory).resolve()
-            target = tmp_path / "Artist" / "[2001] Album [16-44]" / "[1] Song [16-44].flac"
+            target = tmp_path / "Artist" / "Artist - Song [2001][16-44].flac"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(b"same-bytes")
             scanned = [

@@ -61,6 +61,9 @@ Artist/[YEAR] Album [quality]/[track] Title [quality].ext
 Artist/Album [quality]/[track] Title [quality].ext
 ```
 
+Album folders are only used when two or more matching tracks from that album
+are present in the current sort/convert set.
+
 Multi-disc album:
 
 ```text
@@ -70,7 +73,7 @@ Artist/[YEAR] Album [quality]/[disc-track] Title [quality].ext
 Single:
 
 ```text
-Artist/[YEAR] Artist - Title [quality].ext
+Artist/Artist - Title [YEAR][quality].ext
 Artist/Artist - Title [quality].ext
 ```
 
@@ -81,7 +84,8 @@ Various Artists album:
 VA - Album [quality]/[track] Artist - Title [quality].ext
 ```
 
-Lossy uses the same structure under `./_Lossy`.
+Lossy uses the same structure under `./_Lossy`; single-track lossy quality
+labels are uppercased, for example `Artist - Title [YEAR][MP3].mp3`.
 
 ## Commands
 
@@ -118,7 +122,7 @@ Converts eligible lossless audio to ALAC `.m4a`, validates the output, and prese
 Current implementation notes:
 
 - release conversion requires stable album metadata across the release directory
-- single-file conversion requires `artist` and `title`
+- single-file conversion requires `artist` (or a non-VA `album_artist`) and `title`
 - if a valid ALAC destination already exists, conversion is skipped
 - failed conversions are quarantined
 

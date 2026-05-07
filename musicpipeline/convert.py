@@ -9,7 +9,14 @@ from pathlib import Path
 
 from .constants import ARTWORK_PRIORITY, ORIGINAL_SOURCE_DIR_NAME, QUARANTINE_DIR_NAME, SIDECAR_EXTENSIONS, STATE_DIR_NAME
 from .models import PlannedOperation, ScannedFile
-from .normalize import album_quality_suffix, apply_album_group_consensus, build_track_token, codec_quality_tag, normalize_metadata
+from .normalize import (
+    album_quality_suffix,
+    apply_album_group_consensus,
+    build_track_token,
+    codec_quality_tag,
+    normalize_metadata,
+    single_track_filename,
+)
 from .probe import ProbeResult, validate_alac_output, validate_audio_decode
 
 _DISC_DIR_RE = re.compile(r"^(disc|cd)\s*0*\d+$", re.IGNORECASE)
@@ -41,6 +48,10 @@ def _convert_release_unit(root: Path, directory: Path, files: list[ScannedFile],
     if cue_path is not None:
         if _convert_cue_release_unit(root, directory, cue_path, files, logger, dry_run, summary):
             return
+
+    if len(files) == 1:
+        _convert_single_file(root, files[0], logger, dry_run, summary, archive_source_dir=directory)
+        return
 
     release_metadata = _release_metadata_for_unit(directory, files)
     if not release_metadata or any(metadata.album is None or metadata.title is None or (metadata.album_artist is None and metadata.artist is None) for metadata in release_metadata):
@@ -131,18 +142,26 @@ def _convert_release_unit(root: Path, directory: Path, files: list[ScannedFile],
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def _convert_single_file(root: Path, scanned: ScannedFile, logger, dry_run: bool, summary: dict[str, int]) -> None:
+def _convert_single_file(
+    root: Path,
+    scanned: ScannedFile,
+    logger,
+    dry_run: bool,
+    summary: dict[str, int],
+    *,
+    archive_source_dir: Path | None = None,
+) -> None:
     metadata = normalize_metadata(scanned.probe.metadata)
-    if not metadata.artist or not metadata.title:
+    artist_label = _single_artist_label(metadata)
+    if not artist_label or not metadata.title:
         logger.log(f"[convert-skip] ./{scanned.relative_path} (insufficient metadata for single conversion)")
         summary["convert_skipped"] += 1
         return
     quality_tag = codec_quality_tag(scanned.probe)
-    year_prefix = f"[{metadata.year}] " if metadata.year else ""
-    output_name = f"{year_prefix}{metadata.artist} - {metadata.title} [{quality_tag}].m4a"
-    target = root / metadata.artist / output_name
-    archive_target = root / metadata.artist / ORIGINAL_SOURCE_DIR_NAME / scanned.path.name
-    temp_output = root / STATE_DIR_NAME / "tmp" / f"{scanned.path.stem}.tmp.m4a"
+    output_name = single_track_filename(artist_label, metadata.title, metadata.year, quality_tag, ".m4a")
+    target = root / artist_label / output_name
+    archive_source, archive_target = _single_archive_route(root, scanned, artist_label, metadata, archive_source_dir)
+    temp_output = root / STATE_DIR_NAME / "tmp" / scanned.relative_path.with_suffix(".tmp.m4a")
     artwork = _select_artwork(scanned.path.parent)
     if archive_target.exists():
         logger.log(f"[convert-skip] ./{scanned.relative_path} (source archive already exists at ./{archive_target.relative_to(root)})")
@@ -167,14 +186,47 @@ def _convert_single_file(root: Path, scanned: ScannedFile, logger, dry_run: bool
             temp_output.unlink()
         return
     logger.log(f"[convert] ./{scanned.relative_path} -> ./{target.relative_to(root)}")
-    logger.log(f"[preserve-source] ./{scanned.relative_path} -> ./{archive_target.relative_to(root)}")
+    logger.log(f"[preserve-source] ./{archive_source.relative_to(root)} -> ./{archive_target.relative_to(root)}")
     if not dry_run:
         target.parent.mkdir(parents=True, exist_ok=True)
         archive_target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(temp_output), str(target))
-        shutil.move(str(scanned.path), str(archive_target))
+        shutil.move(str(archive_source), str(archive_target))
     summary["converted_files"] += 1
     summary["preserved_source_units"] += 1
+
+
+def _single_artist_label(metadata) -> str | None:
+    if metadata.artist:
+        return metadata.artist
+    if metadata.is_various_artists:
+        return None
+    return metadata.routing_artist
+
+
+def _single_archive_route(
+    root: Path,
+    scanned: ScannedFile,
+    artist_label: str,
+    metadata,
+    archive_source_dir: Path | None,
+) -> tuple[Path, Path]:
+    if archive_source_dir is None:
+        return scanned.path, root / artist_label / ORIGINAL_SOURCE_DIR_NAME / scanned.path.name
+
+    archive_target = root / artist_label / ORIGINAL_SOURCE_DIR_NAME / _archive_single_dir_name(metadata, archive_source_dir)
+    try:
+        archive_target.relative_to(archive_source_dir)
+    except ValueError:
+        return archive_source_dir, archive_target
+    return scanned.path, root / artist_label / ORIGINAL_SOURCE_DIR_NAME / scanned.path.name
+
+
+def _archive_single_dir_name(metadata, directory: Path) -> str:
+    if metadata.album:
+        year_prefix = f"[{metadata.year}] " if metadata.year else ""
+        return f"{year_prefix}{metadata.album}"
+    return directory.name
 
 
 def _convert_unresolved_release_unit(
@@ -401,9 +453,18 @@ def _convert_cue_release_unit(
         summary["cue_split_failures"] += 1
         return True
     first = normalized_tracks[0]
+    single_routable = routable and len(normalized_tracks) == 1 and _single_artist_label(first) is not None and first.title is not None
     quality_suffix = album_quality_suffix([codec_quality_tag(source.probe) for source in files])
-    target_dir = root / _release_destination_root(first, quality_suffix) if routable else directory
-    archive_dir = (root / (first.routing_artist or "Unknown Artist") / ORIGINAL_SOURCE_DIR_NAME / _archive_release_dir_name(first)) if routable else (directory / ORIGINAL_SOURCE_DIR_NAME)
+    if single_routable:
+        single_artist = _single_artist_label(first) or "Unknown Artist"
+        target_dir = root / single_artist
+        archive_dir = root / single_artist / ORIGINAL_SOURCE_DIR_NAME / _archive_single_dir_name(first, directory)
+    elif routable:
+        target_dir = root / _release_destination_root(first, quality_suffix)
+        archive_dir = root / (first.routing_artist or "Unknown Artist") / ORIGINAL_SOURCE_DIR_NAME / _archive_release_dir_name(first)
+    else:
+        target_dir = directory
+        archive_dir = directory / ORIGINAL_SOURCE_DIR_NAME
     artwork = _select_artwork(directory)
     temp_dir = root / STATE_DIR_NAME / "tmp" / directory.relative_to(root)
     if archive_dir.exists():
@@ -427,12 +488,24 @@ def _convert_cue_release_unit(
                 duration = float(track_entries[index + 1]["index_seconds"]) - start
             inferred_disc = _disc_number_from_path(directory, source_file.path) or metadata.disc_number
             effective_metadata = replace(metadata, disc_number=inferred_disc)
-            output_name = _release_output_name(
-                effective_metadata,
-                source_file.probe,
-                source_file.path.suffix,
-                inferred_disc is not None and inferred_disc > 1 or len({(_disc_number_from_path(directory, source.path) or 1) for source in files}) > 1,
-            ) if routable else _cue_unresolved_output_name(track, metadata)
+            if single_routable:
+                artist_label = _single_artist_label(effective_metadata) or "Unknown Artist"
+                output_name = single_track_filename(
+                    artist_label,
+                    effective_metadata.title or f"Track {track['track_number']}",
+                    effective_metadata.year,
+                    codec_quality_tag(source_file.probe),
+                    ".m4a",
+                )
+            elif routable:
+                output_name = _release_output_name(
+                    effective_metadata,
+                    source_file.probe,
+                    source_file.path.suffix,
+                    inferred_disc is not None and inferred_disc > 1 or len({(_disc_number_from_path(directory, source.path) or 1) for source in files}) > 1,
+                )
+            else:
+                output_name = _cue_unresolved_output_name(track, metadata)
             temp_output = temp_dir / f"{Path(output_name).stem}.tmp.m4a"
             final_output = target_dir / output_name
             if final_output.exists():

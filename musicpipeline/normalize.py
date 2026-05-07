@@ -242,6 +242,20 @@ def album_quality_suffix(quality_tags: list[str]) -> str:
     return "".join(f"[{tag}]" for tag in values)
 
 
+def single_track_filename(
+    artist: str,
+    title: str,
+    year: str | None,
+    quality_tag: str,
+    suffix: str,
+    *,
+    lossy: bool = False,
+) -> str:
+    year_part = f"[{year}]" if year else ""
+    display_quality = quality_tag.upper() if lossy else quality_tag
+    return f"{artist} - {title} {year_part}[{display_quality}]{suffix}"
+
+
 def _quality_sort_key(tag: str) -> tuple[int, int, int, str]:
     match = _NUMERIC_QUALITY_RE.match(tag)
     if match:
