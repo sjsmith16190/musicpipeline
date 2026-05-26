@@ -71,6 +71,42 @@ _musicpipeline_python() {
         translated+=("$positional_root")
       fi
       ;;
+    title-resolution)
+      while (( $# )); do
+        case "$1" in
+          --root)
+            saw_root_flag=1
+            translated+=("$1")
+            shift
+            (( $# )) || { print -ru2 -- "error: --root requires a directory argument"; return 1; }
+            translated+=("$1")
+            ;;
+          -h|--help)
+            saw_help_flag=1
+            translated+=("$1")
+            ;;
+          --dry-run|--write)
+            translated+=("$1")
+            ;;
+          --)
+            ;;
+          -*)
+            translated+=("$1")
+            ;;
+          *)
+            if [[ -z "$positional_root" ]]; then
+              positional_root="$1"
+            else
+              translated+=("$1")
+            fi
+            ;;
+        esac
+        shift
+      done
+      if [[ -n "$positional_root" ]]; then
+        translated+=("$positional_root")
+      fi
+      ;;
     audio-scrape)
       while (( $# )); do
         case "$1" in

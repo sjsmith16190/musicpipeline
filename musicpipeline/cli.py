@@ -10,10 +10,11 @@ from .commands import (
     command_convert,
     command_delete_empty_dirs,
     command_delete_source,
-    command_undo,
     command_retag_apply,
     command_retag_review,
     command_sort,
+    command_title_resolution,
+    command_undo,
 )
 
 
@@ -25,14 +26,16 @@ def build_parser() -> argparse.ArgumentParser:
             "planning (`audit`), sorting (`sort`), lossless-to-ALAC conversion "
             "(`convert`), combined convert+sort runs (`both`), source cleanup "
             "(`delete-source`), retag review/application (`retag`, `retag-apply`), "
-            "undo, empty-directory cleanup, and audio importing from external "
-            "staging folders (`audio-scrape`)."
+            "undo, empty-directory cleanup, title resolution updates "
+            "(`title-resolution`), and audio importing from external staging "
+            "folders (`audio-scrape`)."
         ),
         epilog=(
             "Run `musicpipeline <command> --help` for detailed help on one command.\n"
             "Examples:\n"
             "  musicpipeline sort --dry-run\n"
             "  musicpipeline both /path/to/library\n"
+            "  musicpipeline title-resolution\n"
             "  musicpipeline audio-scrape /path/to/source --destination /path/to/library"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
@@ -169,6 +172,46 @@ def build_parser() -> argparse.ArgumentParser:
             "`.musicpipeline/retag_review.json` path is used."
         ),
     )
+    title_resolution = subparsers.add_parser(
+        "title-resolution",
+        help="append [bit-sample] to audio title tags with an interactive dry-run/write flow",
+        description=(
+            "Recursively scan audio files and update each title tag to include the "
+            "track resolution in `[bit-sample]` format, such as `My Baby [24-192]`. "
+            "If you do not pass a directory or mode flag, the command prompts for "
+            "the directory, asks whether to dry run or write, and can continue "
+            "directly from the dry run into the real write on the same directory."
+        ),
+    )
+    title_resolution.add_argument(
+        "--root",
+        type=Path,
+        help=(
+            "directory to scan recursively. If omitted, the command prompts for it "
+            "instead of silently using the current directory."
+        ),
+    )
+    title_resolution.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help=(
+            "optional positional shorthand for the directory to scan. When both "
+            "are given, this positional path takes precedence over `--root`."
+        ),
+    )
+    title_resolution_mode = title_resolution.add_mutually_exclusive_group()
+    title_resolution_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="preview title tag changes without writing them.",
+    )
+    title_resolution_mode.add_argument(
+        "--write",
+        action="store_true",
+        help="write title tag changes immediately without the dry-run prompt.",
+    )
+    title_resolution.set_defaults(_subparser=title_resolution)
 
     delete_source = _add_root_command(
         subparsers,
@@ -327,6 +370,14 @@ def main(argv: list[str] | None = None) -> int:
             _resolved_root(args),
             manifest_path=args.manifest.resolve() if args.manifest else None,
             dry_run=args.dry_run,
+        )
+    if command == "title-resolution":
+        requested_root = args.target or args.root
+        requested_dry_run = True if args.dry_run else None
+        return command_title_resolution(
+            requested_root.resolve() if requested_root else None,
+            dry_run=requested_dry_run,
+            write=args.write,
         )
     if command == "delete-source":
         return command_delete_source(_resolved_root(args), dry_run=args.dry_run, yes=args.yes)

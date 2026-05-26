@@ -11,6 +11,7 @@ The current implementation is centered on a Python planner/executor with a thin 
 - `audio-scrape`
 - `retag`
 - `retag-apply`
+- `title-resolution`
 - `undo`
 - `delete-empty-dirs`
 - `delete-source`
@@ -24,6 +25,7 @@ Your shell can keep exposing `musicpipeline` by sourcing [musicpipeline.zsh](/Us
 - Python 3.11+
 - `ffprobe`
 - `ffmpeg`
+- `exiftool` for `retag-apply` and `title-resolution`
 - `yt-dlp` for `musicpipelineyt`
 - `fpcalc` plus an `ACOUSTID_CLIENT` API key for `retag` on untagged files
 
@@ -246,6 +248,28 @@ Examples:
 python3 -m musicpipeline retag-apply --root "/path/to/library"
 python3 -m musicpipeline retag-apply --dry-run --root "/path/to/library"
 zsh ./musicpipeline.zsh retag-apply "/path/to/library"
+```
+
+### `title-resolution`
+
+Updates track title tags to append the audio resolution in `[bit-sample]` format.
+
+Behavior:
+
+- recursively scans common audio formats under the chosen directory
+- uses `ffprobe` to read bit depth and sample rate
+- writes title tags with `exiftool`
+- skips macOS hidden metadata files such as `._track.m4a`
+- in interactive mode, prompts for the directory and whether to dry run or write
+- after an interactive dry run, offers to run the real write immediately on the same directory
+
+Examples:
+
+```zsh
+python3 -m musicpipeline title-resolution
+python3 -m musicpipeline title-resolution --root "/path/to/library" --dry-run
+python3 -m musicpipeline title-resolution "/path/to/library" --write
+zsh ./musicpipeline.zsh title-resolution
 ```
 
 ### `delete-source`

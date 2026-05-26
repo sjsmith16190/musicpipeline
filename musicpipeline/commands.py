@@ -23,6 +23,7 @@ from .planner import build_sort_plan
 from .probe import probe_file
 from .retag import apply_retag_review, build_retag_review
 from .scan import iter_scanned_files
+from .title_resolution import apply_resolution_titles, ensure_title_resolution_tools
 from .undo import command_undo as _command_undo
 
 
@@ -218,6 +219,37 @@ def command_undo(root: Path, *, dry_run: bool = False, run_id: str | None = None
     return _command_undo(root, dry_run=dry_run, run_id=run_id)
 
 
+def command_title_resolution(
+    root: Path | None = None,
+    *,
+    dry_run: bool | None = None,
+    write: bool = False,
+) -> int:
+    missing = ensure_title_resolution_tools()
+    if missing:
+        print(f"error: missing required tool(s): {', '.join(missing)}", file=sys.stderr, flush=True)
+        return 2
+
+    interactive = root is None or (dry_run is None and not write)
+    selected_root = _prompt_for_directory(root)
+    if selected_root is None:
+        return 1
+
+    if write:
+        selected_dry_run = False
+    elif dry_run is None:
+        selected_dry_run = _prompt_for_dry_run()
+    else:
+        selected_dry_run = dry_run
+
+    summary = apply_resolution_titles(selected_root, dry_run=selected_dry_run)
+    if selected_dry_run and interactive and summary.failed == 0 and _prompt_yes_no(
+        "Run the write now on this same directory? [y/N]: "
+    ):
+        summary = apply_resolution_titles(selected_root, dry_run=False)
+    return 0 if summary.failed == 0 else 1
+
+
 def _log_summary(logger: RunLogger, summary: dict[str, int], dry_run: bool) -> None:
     logger.log("")
     logger.log("Run summary:")
@@ -225,6 +257,41 @@ def _log_summary(logger: RunLogger, summary: dict[str, int], dry_run: bool) -> N
         logger.log(f"  {key}: {summary[key]}")
     if dry_run:
         logger.log("  dry_run: 1")
+
+
+def _prompt_for_directory(root: Path | None) -> Path | None:
+    if root is not None:
+        selected = root.resolve()
+    else:
+        while True:
+            reply = input(f"Directory to scan [{Path.cwd()}]: ").strip()
+            selected = Path(reply).expanduser() if reply else Path.cwd()
+            selected = selected.resolve()
+            if selected.exists() and selected.is_dir():
+                break
+            print(f"error: not a directory: {selected}", file=sys.stderr, flush=True)
+    if not selected.exists():
+        print(f"error: directory does not exist: {selected}", file=sys.stderr, flush=True)
+        return None
+    if not selected.is_dir():
+        print(f"error: not a directory: {selected}", file=sys.stderr, flush=True)
+        return None
+    return selected
+
+
+def _prompt_for_dry_run() -> bool:
+    while True:
+        reply = input("Run as dry run or write tags? [d/w]: ").strip().casefold()
+        if reply in {"", "d", "dry", "dry-run"}:
+            return True
+        if reply in {"w", "write", "real"}:
+            return False
+        print("Please answer with 'd' for dry run or 'w' for write.", flush=True)
+
+
+def _prompt_yes_no(prompt: str) -> bool:
+    reply = input(prompt).strip().casefold()
+    return reply in {"y", "yes"}
 
 
 def _log_delete_source_audit(root: Path, target: Path, logger: RunLogger) -> None:

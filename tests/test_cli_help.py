@@ -18,6 +18,7 @@ class CliHelpTests(unittest.TestCase):
         self.assertIn("Normalize and maintain a messy music intake library.", output)
         self.assertIn("commands:", output)
         self.assertIn("audio-scrape       import audio plus sidecars", output)
+        self.assertIn("title-resolution   append [bit-sample] to audio title tags", output)
         self.assertIn("musicpipeline <command> --help", output)
 
     def test_subcommand_help_includes_description_and_detailed_options(self):
