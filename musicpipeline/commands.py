@@ -224,10 +224,14 @@ def command_title_resolution(
     *,
     dry_run: bool | None = None,
     write: bool = False,
+    jobs: int | None = None,
 ) -> int:
     missing = ensure_title_resolution_tools()
     if missing:
         print(f"error: missing required tool(s): {', '.join(missing)}", file=sys.stderr, flush=True)
+        return 2
+    if jobs is not None and jobs < 1:
+        print("error: jobs must be at least 1", file=sys.stderr, flush=True)
         return 2
 
     interactive = root is None or (dry_run is None and not write)
@@ -242,11 +246,11 @@ def command_title_resolution(
     else:
         selected_dry_run = dry_run
 
-    summary = apply_resolution_titles(selected_root, dry_run=selected_dry_run)
+    summary = apply_resolution_titles(selected_root, dry_run=selected_dry_run, jobs=jobs)
     if selected_dry_run and interactive and summary.failed == 0 and _prompt_yes_no(
         "Run the write now on this same directory? [y/N]: "
     ):
-        summary = apply_resolution_titles(selected_root, dry_run=False)
+        summary = apply_resolution_titles(selected_root, dry_run=False, jobs=jobs)
     return 0 if summary.failed == 0 else 1
 
 

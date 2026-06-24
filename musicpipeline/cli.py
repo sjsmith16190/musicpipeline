@@ -211,6 +211,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write title tag changes immediately without the dry-run prompt.",
     )
+    title_resolution.add_argument(
+        "--jobs",
+        type=int,
+        help=(
+            "number of files to probe or write in parallel. Defaults to a modest "
+            "auto-selected worker count."
+        ),
+    )
     title_resolution.set_defaults(_subparser=title_resolution)
 
     delete_source = _add_root_command(
@@ -378,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
             requested_root.resolve() if requested_root else None,
             dry_run=requested_dry_run,
             write=args.write,
+            jobs=args.jobs,
         )
     if command == "delete-source":
         return command_delete_source(_resolved_root(args), dry_run=args.dry_run, yes=args.yes)

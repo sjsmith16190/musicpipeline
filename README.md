@@ -257,17 +257,20 @@ Updates track title tags to append the audio resolution in `[bit-sample]` format
 Behavior:
 
 - recursively scans common audio formats under the chosen directory
+- probes and writes files in parallel for faster large-library runs
 - uses `ffprobe` to read bit depth and sample rate
 - writes title tags with `exiftool`
 - skips macOS hidden metadata files such as `._track.m4a`
 - in interactive mode, prompts for the directory and whether to dry run or write
 - after an interactive dry run, offers to run the real write immediately on the same directory
+- accepts `--jobs N` to control parallelism when you want to tune throughput
 
 Examples:
 
 ```zsh
 python3 -m musicpipeline title-resolution
 python3 -m musicpipeline title-resolution --root "/path/to/library" --dry-run
+python3 -m musicpipeline title-resolution "/path/to/library" --dry-run --jobs 8
 python3 -m musicpipeline title-resolution "/path/to/library" --write
 zsh ./musicpipeline.zsh title-resolution
 ```
