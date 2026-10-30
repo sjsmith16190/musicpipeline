@@ -9,6 +9,7 @@ The current implementation is centered on a Python planner/executor with a thin 
 - `convert`
 - `both`
 - `audio-scrape`
+- `grab`
 - `retag`
 - `retag-apply`
 - `title-resolution`
@@ -26,7 +27,7 @@ Your shell can keep exposing `musicpipeline` by sourcing [musicpipeline.zsh](/Us
 - `ffprobe`
 - `ffmpeg`
 - `exiftool` for `retag-apply` and `title-resolution`
-- `yt-dlp` for `musicpipelineyt`
+- `yt-dlp` for `grab` and `musicpipelineyt`
 - `fpcalc` plus an `ACOUSTID_CLIENT` API key for `retag` on untagged files
 
 ## Managed Roots
@@ -175,6 +176,43 @@ python3 -m musicpipeline audio-scrape "/path/to/source" --move
 python3 -m musicpipeline audio-scrape "/path/to/source" --destination "/path/to/library"
 python3 -m musicpipeline audio-scrape "/path/to/source" --destination "/path/to/library" --bucket-by-format
 zsh ./musicpipeline.zsh audio-scrape --output "/path/to/library" "/path/to/source"
+```
+
+### `grab`
+
+Downloads the best available audio-only stream from a YouTube URL using `yt-dlp`.
+
+Behavior:
+
+- accepts the URL as a positional argument, including a quoted shell variable
+- defaults to the current directory; `--output-dir DIR` (or `-o DIR`) chooses another destination
+- defaults to ALAC (Apple Lossless) audio in a `.m4a` file
+- `--audio-format flac` or `--audio-format wav` chooses FLAC or uncompressed WAV
+- ALAC, FLAC, and WAV output uses 24-bit PCM and keeps the source sample rate and channel count
+- validates the encoded output before replacing the downloaded source; existing files with a different source path are protected from overwrites
+- `--audio-format native` keeps the original encoded audio without re-encoding, such as `.opus` for Opus or `.m4a` for AAC
+- selects `bestaudio` using yt-dlp's quality ranking and fails if an audio-only stream is unavailable
+- saves audio plus an `.info.json` metadata sidecar under source/playlist subfolders
+- prints the saved path, codec, sample rate, channels, and bitrate after downloading
+- `--dry-run` shows the selected source format and path before audio extraction without downloading or creating directories
+- video URLs download only that video by default, even if they contain a playlist ID; `--playlist` includes the whole playlist
+- playlist-only URLs download the playlist
+
+This is an independent download command. Run library sorting or other processing separately when needed.
+The quality is limited to the audio YouTube makes available. An Opus or AAC source is already lossy. Saving it as ALAC, FLAC, or WAV avoids further lossy compression but cannot recover the uploader's original lossless master. ALAC uses a `.m4a` container; a `.m4a` extension alone does not distinguish ALAC from lossy AAC.
+
+Examples:
+
+```zsh
+musicpipeline grab "https://www.youtube.com/watch?v=VIDEO_ID"
+musicpipeline grab "$YOUTUBE_URL" --output-dir "/path/to/downloads"
+musicpipeline grab "$YOUTUBE_URL" --audio-format flac
+musicpipeline grab "$YOUTUBE_URL" --audio-format wav
+musicpipeline grab "$YOUTUBE_URL" --audio-format native
+musicpipeline grab "$YOUTUBE_URL" --dry-run
+musicpipeline grab "$YOUTUBE_URL" --playlist
+python3 -m musicpipeline grab "$YOUTUBE_URL" --output-dir "/path/to/downloads"
+zsh ./musicpipeline.zsh grab "$YOUTUBE_URL" --dry-run
 ```
 
 ### `delete-empty-dirs`

@@ -1,23 +1,40 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+OUTPUT_FORMATS = ("alac", "flac", "wav", "native")
+
+
+def add_audio_format_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--audio-format",
+        choices=OUTPUT_FORMATS,
+        default="alac",
+        help=(
+            "output format: alac (.m4a, default), flac, wav, or native "
+            "(original codec). Lossless output cannot restore quality missing "
+            "from the YouTube source."
+        ),
+    )
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="musicpipelineyt",
         description=(
-            "Download the best native audio stream yt-dlp can get for a single "
-            "YouTube URL or playlist without converting it."
+            "Download the best audio stream yt-dlp can get for a single "
+            "YouTube URL or playlist and save it as ALAC, FLAC, WAV, or native audio."
         ),
     )
     parser.add_argument("--output-dir", required=True, type=Path, help="folder where the downloaded audio should land")
     parser.add_argument("--dry-run", action="store_true", help="show the selected format and destination without downloading")
+    add_audio_format_argument(parser)
     parser.add_argument("uri", help="YouTube video or playlist URL")
     return parser
 
@@ -25,10 +42,19 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return run(args.output_dir.resolve(), args.uri, dry_run=args.dry_run)
+    return run(args.output_dir.resolve(), args.uri, dry_run=args.dry_run, audio_format=args.audio_format)
 
 
-def run(output_dir: Path, uri: str, dry_run: bool = False) -> int:
+def run(
+    output_dir: Path,
+    uri: str,
+    dry_run: bool = False,
+    *,
+    playlist: bool = True,
+    audio_format: str = "alac",
+) -> int:
+    if audio_format not in OUTPUT_FORMATS:
+        raise ValueError(f"unsupported audio format: {audio_format}")
     for command in ("yt-dlp", "ffmpeg", "ffprobe"):
         _need_cmd(command)
 
@@ -42,8 +68,11 @@ def run(output_dir: Path, uri: str, dry_run: bool = False) -> int:
         "--output-na-placeholder",
         "?",
         "--format",
-        "bestaudio/best",
-        "--yes-playlist",
+        "bestaudio",
+        "--extract-audio",
+        "--audio-format",
+        "best",
+        "--yes-playlist" if playlist else "--no-playlist",
         "--write-info-json",
         "--paths",
         f"home:{output_dir}",
@@ -56,22 +85,24 @@ def run(output_dir: Path, uri: str, dry_run: bool = False) -> int:
             [
                 "--simulate",
                 "--print",
-                "before_dl:----------------------------------------",
+                "video:----------------------------------------",
                 "--print",
-                "before_dl:Title: %(playlist_index&{} - |)s%(title|untitled)s",
+                "video:Title: %(playlist_index&{} - |)s%(title|untitled)s",
                 "--print",
-                "before_dl:Format: id=%(format_id|?)s ext=%(ext|?)s acodec=%(acodec|?)s abr=%(abr|?)s asr=%(asr|?)s",
+                "video:Format: id=%(format_id|?)s ext=%(ext|?)s acodec=%(acodec|?)s abr=%(abr|?)s asr=%(asr|?)s",
                 "--print",
-                "before_dl:Path: %(filename|unknown)s",
+                "video:Source path (before audio extraction): %(filename|unknown)s",
+                "--print",
+                f"video:Output audio format: {audio_format}",
             ]
         )
-        return subprocess.run(command + [uri], check=False).returncode
+        return subprocess.run(command + ["--", uri], check=False).returncode
 
     with tempfile.NamedTemporaryFile(prefix="musicpipelineyt.paths.", delete=False) as handle:
         path_log = Path(handle.name)
     try:
         completed = subprocess.run(
-            command + ["--print", "after_move:filepath", uri],
+            command + ["--print", "after_move:filepath", "--", uri],
             check=False,
             capture_output=True,
             text=True,
@@ -86,10 +117,59 @@ def run(output_dir: Path, uri: str, dry_run: bool = False) -> int:
         for line in path_log.read_text(encoding="utf-8").splitlines():
             downloaded_file = line.strip()
             if downloaded_file:
-                report_file(Path(downloaded_file))
+                try:
+                    audio_path = _convert_audio(Path(downloaded_file), audio_format)
+                except (OSError, ValueError, RuntimeError) as error:
+                    print(f"error: {error}", file=sys.stderr)
+                    return 1
+                report_file(audio_path)
         return 0
     finally:
         path_log.unlink(missing_ok=True)
+
+
+def _convert_audio(source: Path, audio_format: str) -> Path:
+    if audio_format == "native":
+        return source
+    extension, codec, options = {
+        "alac": (".m4a", "alac", ["-sample_fmt", "s32p", "-bits_per_raw_sample", "24", "-movflags", "+faststart"]),
+        "flac": (".flac", "flac", ["-sample_fmt", "s32", "-bits_per_raw_sample", "24"]),
+        "wav": (".wav", "pcm_s24le", []),
+    }[audio_format]
+    destination = source.with_suffix(extension)
+    if destination != source and destination.exists():
+        raise FileExistsError(f"output already exists: {destination}; downloaded source retained at {source}")
+    with tempfile.NamedTemporaryFile(prefix=".musicpipeline-grab-", suffix=extension, dir=source.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        completed = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(source),
+             "-map", "0:a:0", "-vn", "-map_metadata", "0", "-c:a", codec,
+             *options, str(temporary)],
+            check=False, capture_output=True, text=True,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"{audio_format} encoding failed; source retained at {source}\n{completed.stderr.strip()}")
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+             "stream=codec_name", "-of", "json", str(temporary)],
+            check=False, capture_output=True, text=True,
+        )
+        try:
+            streams = json.loads(probe.stdout).get("streams", [])
+        except (ValueError, AttributeError):
+            streams = []
+        if probe.returncode != 0 or not streams or streams[0].get("codec_name") != codec:
+            raise RuntimeError(f"{audio_format} output validation failed; source retained at {source}")
+        if destination == source:
+            temporary.replace(destination)
+        else:
+            # Publish without overwriting a file created while ffmpeg was running.
+            destination.hardlink_to(temporary)
+            source.unlink()
+        return destination
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def report_file(path: Path) -> None:
@@ -159,3 +239,7 @@ def _need_cmd(command: str) -> None:
 
 def _output_template() -> str:
     return "%(playlist,uploader,channel|Unknown Source)s/%(playlist_index&{} - |)s%(title|untitled)s [%(id)s].%(ext)s"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

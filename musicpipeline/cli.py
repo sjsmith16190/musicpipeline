@@ -16,6 +16,7 @@ from .commands import (
     command_title_resolution,
     command_undo,
 )
+from .youtube import add_audio_format_argument, run as command_grab
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
             "(`delete-source`), retag review/application (`retag`, `retag-apply`), "
             "undo, empty-directory cleanup, title resolution updates "
             "(`title-resolution`), and audio importing from external staging "
-            "folders (`audio-scrape`)."
+            "folders (`audio-scrape`) or YouTube (`grab`)."
         ),
         epilog=(
             "Run `musicpipeline <command> --help` for detailed help on one command.\n"
@@ -36,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  musicpipeline sort --dry-run\n"
             "  musicpipeline both /path/to/library\n"
             "  musicpipeline title-resolution\n"
+            "  musicpipeline grab 'https://www.youtube.com/watch?v=VIDEO_ID'\n"
             "  musicpipeline audio-scrape /path/to/source --destination /path/to/library"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
@@ -297,6 +299,39 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     audio_scrape.set_defaults(_subparser=audio_scrape)
+
+    grab = subparsers.add_parser(
+        "grab",
+        help="download the best available YouTube audio as an audio file",
+        description=(
+            "Download the best available audio-only stream from a YouTube URL "
+            "using yt-dlp. Saves ALAC in .m4a by default, with FLAC, WAV, and "
+            "native audio options. Lossless output preserves the decoded source "
+            "without restoring detail lost by YouTube. Files are "
+            "saved under source/playlist subfolders in the output directory. "
+            "Video URLs download a single track by default, even when the URL "
+            "also contains a playlist ID."
+        ),
+    )
+    grab.add_argument("uri", help="YouTube video or playlist URL")
+    add_audio_format_argument(grab)
+    grab.add_argument(
+        "--output-dir",
+        "-o",
+        type=Path,
+        default=Path.cwd(),
+        help="folder where the audio should land. Defaults to the current directory.",
+    )
+    grab.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show the selected audio format and destination without downloading.",
+    )
+    grab.add_argument(
+        "--playlist",
+        action="store_true",
+        help="download the whole playlist when a video URL also contains a playlist ID.",
+    )
     return parser
 
 
@@ -361,6 +396,14 @@ def main(argv: list[str] | None = None) -> int:
             move=args.move,
             dry_run=args.dry_run,
             bucket_by_format=args.bucket_by_format,
+        )
+    if command == "grab":
+        return command_grab(
+            args.output_dir.resolve(),
+            args.uri,
+            dry_run=args.dry_run,
+            playlist=args.playlist,
+            audio_format=args.audio_format,
         )
     if command == "delete-empty-dirs":
         return command_delete_empty_dirs(_resolved_root(args), dry_run=args.dry_run)

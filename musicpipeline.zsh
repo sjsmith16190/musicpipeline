@@ -160,6 +160,9 @@ _musicpipeline_python() {
         translated+=("$audio_scrape_source")
       fi
       ;;
+    grab)
+      translated=("$@")
+      ;;
     *)
       print -ru2 -- "error: unsupported command: $command_name"
       PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}" command python3 -m musicpipeline --help
