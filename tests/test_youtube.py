@@ -73,6 +73,7 @@ class YouTubeHelperTests(unittest.TestCase):
         self.assertIn("--no-playlist", command)
         self.assertNotIn("--yes-playlist", command)
         self.assertIn("--extract-audio", command)
+        self.assertNotIn("--write-info-json", command)
         self.assertEqual(command[command.index("--audio-format") + 1], "best")
         self.assertEqual(command[-2:], ["--", uri])
 
@@ -134,6 +135,7 @@ class YouTubeHelperTests(unittest.TestCase):
             info_path.write_text(json.dumps({
                 "id": "offline-audio-test",
                 "title": "Offline Audio Test",
+                "artist": "Test Artist",
                 "uploader": "Test Uploader",
                 "extractor": "youtube",
                 "formats": [
@@ -165,7 +167,7 @@ class YouTubeHelperTests(unittest.TestCase):
             self.assertFalse(output_dir.exists())
             self.assertEqual(result, 0, results[0].stderr)
             self.assertIn("Format: id=audio-best ext=webm acodec=opus abr=160", results[0].stdout)
-            self.assertIn(str(output_dir / "Test Uploader"), results[0].stdout)
+            self.assertIn(str(output_dir / "Test Artist - Offline Audio Test [YouTube].webm"), results[0].stdout)
 
     @unittest.skipUnless(
         all(shutil.which(command) for command in ("yt-dlp", "ffmpeg", "ffprobe")),
@@ -223,6 +225,9 @@ class YouTubeHelperTests(unittest.TestCase):
                 self.assertEqual(result, 0, stderr.getvalue())
                 outputs = list(output_dir.rglob(f"*.{output_ext}"))
                 self.assertEqual(len(outputs), 1)
+                self.assertEqual(outputs[0].parent, output_dir)
+                self.assertEqual(outputs[0].name, f"Test Uploader - Audio Test [YouTube].{output_ext}")
+                self.assertFalse(list(output_dir.rglob("*.info.json")))
                 self.assertIn(f"saved: {outputs[0]}", stdout.getvalue())
                 if audio_format == "native":
                     self.assertEqual(packet_hashes(source), packet_hashes(outputs[0]))

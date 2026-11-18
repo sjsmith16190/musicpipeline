@@ -73,7 +73,6 @@ def run(
         "--audio-format",
         "best",
         "--yes-playlist" if playlist else "--no-playlist",
-        "--write-info-json",
         "--paths",
         f"home:{output_dir}",
         "--output",
@@ -238,7 +237,7 @@ def _need_cmd(command: str) -> None:
 
 
 def _output_template() -> str:
-    return "%(playlist,uploader,channel|Unknown Source)s/%(playlist_index&{} - |)s%(title|untitled)s [%(id)s].%(ext)s"
+    return "%(artist,uploader,channel|Unknown Artist)s - %(title|untitled)s [YouTube].%(ext)s"
 
 
 if __name__ == "__main__":

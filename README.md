@@ -192,7 +192,8 @@ Behavior:
 - validates the encoded output before replacing the downloaded source; existing files with a different source path are protected from overwrites
 - `--audio-format native` keeps the original encoded audio without re-encoding, such as `.opus` for Opus or `.m4a` for AAC
 - selects `bestaudio` using yt-dlp's quality ranking and fails if an audio-only stream is unavailable
-- saves audio plus an `.info.json` metadata sidecar under source/playlist subfolders
+- saves the audio file directly in the output directory, without a metadata sidecar
+- names each file `Artist - Title [YouTube].ext`, using the uploader or channel when artist metadata is unavailable
 - prints the saved path, codec, sample rate, channels, and bitrate after downloading
 - `--dry-run` shows the selected source format and path before audio extraction without downloading or creating directories
 - video URLs download only that video by default, even if they contain a playlist ID; `--playlist` includes the whole playlist
